@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable
+from typing import Callable, cast
 
 import torch
 from torch import nn
@@ -78,10 +78,16 @@ def patch_depthwise_convs(model: nn.Module) -> None:
     for module in model.modules():
         if not is_depthwise_3x3(module):
             continue
+        conv = cast(nn.Conv2d, module)
         original_forward = module.forward
         cache: dict[str, object] = {}
 
-        def forward(x, m=module, original=original_forward, cache=cache):
+        def forward(
+            x: torch.Tensor,
+            m: nn.Conv2d = conv,
+            original: Callable[[torch.Tensor], torch.Tensor] = original_forward,
+            cache: dict[str, object] = cache,
+        ) -> torch.Tensor:
             global _dwconv_failed
             if _dwconv_failed or not can_dwconv3x3(x):
                 return original(x)
@@ -90,7 +96,9 @@ def patch_depthwise_convs(model: nn.Module) -> None:
             key = (m.weight.data_ptr(), m.weight.dtype, version_of(m.weight))
             if cache.get("key") != key:
                 cache["key"] = key
-                cache["w"] = m.weight.detach().float().reshape(m.in_channels, 9).contiguous()
+                cache["w"] = (
+                    m.weight.detach().float().reshape(m.in_channels, 9).contiguous()
+                )
                 cache["b"] = (
                     m.bias.detach().float().contiguous() if m.bias is not None else None
                 )

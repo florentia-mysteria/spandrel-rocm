@@ -760,7 +760,12 @@ class _Hip:
         prog = ctypes.c_void_p()
         self._check(
             self.rtc.hiprtcCreateProgram(
-                ctypes.byref(prog), source.encode(), f"{program}.hip".encode(), 0, None, None
+                ctypes.byref(prog),
+                source.encode(),
+                f"{program}.hip".encode(),
+                0,
+                None,
+                None,
             ),
             "hiprtcCreateProgram",
         )
@@ -777,7 +782,10 @@ class _Hip:
                     "HIPRTC compilation failed: " + log.value.decode(errors="replace")
                 )
             size = ctypes.c_size_t()
-            self._check(self.rtc.hiprtcGetCodeSize(prog, ctypes.byref(size)), "hiprtcGetCodeSize")
+            self._check(
+                self.rtc.hiprtcGetCodeSize(prog, ctypes.byref(size)),
+                "hiprtcGetCodeSize",
+            )
             code = ctypes.create_string_buffer(size.value)
             self._check(self.rtc.hiprtcGetCode(prog, code), "hiprtcGetCode")
             return code.raw
@@ -796,7 +804,9 @@ class _Hip:
             for name in names:
                 fn = ctypes.c_void_p()
                 self._check(
-                    self.hip.hipModuleGetFunction(ctypes.byref(fn), module, name.encode()),
+                    self.hip.hipModuleGetFunction(
+                        ctypes.byref(fn), module, name.encode()
+                    ),
                     "hipModuleGetFunction",
                 )
                 funcs[(device_index, name)] = fn
@@ -813,7 +823,9 @@ class _Hip:
         """
         source, names, extra_opts = _PROGRAMS[program]
         arch = torch.cuda.get_device_properties(device_index).gcnArchName.split(":")[0]
-        opts = [f"--offload-arch={arch}".encode(), b"-O3"] + [o.encode() for o in extra_opts]
+        opts = [f"--offload-arch={arch}".encode(), b"-O3"] + [
+            o.encode() for o in extra_opts
+        ]
 
         digest = hashlib.sha256(
             b"|".join([source.encode(), *opts, self._hiprtc_version().encode()])
@@ -861,12 +873,22 @@ class _Hip:
                 fn = self.funcs[(device_index, name)]
         return fn
 
-    def launch(self, fn, grid, block, args, stream, shared_mem: int = 0) -> None:
+    def launch(
+        self,
+        fn: ctypes.c_void_p,
+        grid: tuple[int, int, int],
+        block: tuple[int, int, int],
+        args: list,
+        stream: ctypes.c_void_p,
+        shared_mem: int = 0,
+    ) -> None:
         params = (ctypes.c_void_p * len(args))(
             *[ctypes.cast(ctypes.byref(a), ctypes.c_void_p) for a in args]
         )
         self._check(
-            self.hip.hipModuleLaunchKernel(fn, *grid, *block, shared_mem, stream, params, None),
+            self.hip.hipModuleLaunchKernel(
+                fn, *grid, *block, shared_mem, stream, params, None
+            ),
             "hipModuleLaunchKernel",
         )
 
@@ -891,7 +913,11 @@ def hip_kernels_available() -> bool:
     """Only for AMD's ROCm builds of PyTorch on Windows, where HIPRTC ships with torch."""
     if os.environ.get("SPANDREL_HIP_KERNELS", "").strip() == "0":
         return False
-    return sys.platform == "win32" and bool(torch.version.hip) and torch.cuda.is_available()
+    return (
+        sys.platform == "win32"
+        and bool(torch.version.hip)
+        and torch.cuda.is_available()
+    )
 
 
 def _get_hip() -> _Hip:
@@ -920,14 +946,16 @@ def can_dwconv3x3(x: torch.Tensor) -> bool:
     )
 
 
-def dwconv3x3(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
+def dwconv3x3(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
+) -> torch.Tensor:
     """
     Depthwise 3x3 convolution, stride 1, zero padding 1.
 
     x: (B, C, H, W). weight: (C, 9) float32 contiguous. bias: (C,) float32 or None.
     """
     x = x.contiguous()
-    B, C, H, W = x.shape
+    B, C, H, W = x.shape  # noqa: N806
     hip = _get_hip()
     fn = hip.get(x.device.index or 0, "dwconv", f"dwconv3x3_{_DTYPE_SUFFIX[x.dtype]}")
     y = torch.empty_like(x)
@@ -957,7 +985,12 @@ def _attn_lds_bytes(n: int, d: int, dtype: torch.dtype) -> int:
 
 
 def can_window_attention(
-    qkv: torch.Tensor, H: int, W: int, H_sp: int, W_sp: int, heads: int  # noqa: N803
+    qkv: torch.Tensor,
+    H: int,  # noqa: N803
+    W: int,  # noqa: N803
+    H_sp: int,  # noqa: N803
+    W_sp: int,  # noqa: N803
+    heads: int,
 ) -> bool:
     n = H_sp * W_sp
     if not (qkv.is_cuda and qkv.dim() == 4 and qkv.dtype in _DTYPE_SUFFIX):
@@ -991,7 +1024,9 @@ def _wmma_head_dim(qkv: torch.Tensor, n: int, d: int) -> int:
     """The padded head dim for the WMMA kernel, or 0 if it does not apply."""
     if _wmma_failed or os.environ.get("SPANDREL_HIP_WMMA", "").strip() == "0":
         return 0
-    if qkv.dtype not in (torch.bfloat16, torch.float16) or not _is_gfx12(qkv.device.index or 0):
+    if qkv.dtype not in (torch.bfloat16, torch.float16) or not _is_gfx12(
+        qkv.device.index or 0
+    ):
         return 0
     kd = 16 if d <= 16 else 32 if d <= 32 else 64 if d <= 64 else 0
     if not kd or n % 16 or _wmma_lds_bytes(n, kd) > _LDS_LIMIT:
@@ -1029,7 +1064,7 @@ def window_attention(
     [out_offset, out_offset + heads*d) of it instead, dropping positions
     outside Hc x Wc (the window padding).
     """
-    _, B, _L, C = qkv.shape
+    _, B, _L, C = qkv.shape  # noqa: N806
     d = C // heads
     n = H_sp * W_sp
     if out is None:
@@ -1038,16 +1073,23 @@ def window_attention(
     hip = _get_hip()
     device = qkv.device.index or 0
     kd = _wmma_head_dim(qkv, n, d)
+    fn: ctypes.c_void_p | None = None
     if kd:
         try:
-            fn = hip.get(device, "win_attn_wmma", f"win_attn_wmma_{_DTYPE_SUFFIX[qkv.dtype]}_{kd}")
+            fn = hip.get(
+                device,
+                "win_attn_wmma",
+                f"win_attn_wmma_{_DTYPE_SUFFIX[qkv.dtype]}_{kd}",
+            )
         except Exception as e:  # noqa: BLE001
             # keep the scalar kernel, only the matrix core path is lost
             global _wmma_failed
             _wmma_failed = True
-            logger.warning("WMMA attention kernel unavailable, using the scalar one: %s", e)
+            logger.warning(
+                "WMMA attention kernel unavailable, using the scalar one: %s", e
+            )
             kd = 0
-    if kd:
+    if fn is not None:
         block, shared = 256, _wmma_lds_bytes(n, kd)
     else:
         name = f"win_attn_{_DTYPE_SUFFIX[qkv.dtype]}_{32 if d <= 32 else 64}"
@@ -1115,8 +1157,8 @@ def spatial_gate(
     gamma/beta: (C,) float32. weight: (C, 9) float32. bias: (C,) float32 or None.
     Returns (B, H*W, C).
     """
-    B, L, C2 = x.shape
-    C = C2 // 2
+    B, L, C2 = x.shape  # noqa: N806
+    C = C2 // 2  # noqa: N806
     hip = _get_hip()
     device = x.device.index or 0
     sfx = _DTYPE_SUFFIX[x.dtype]
@@ -1176,14 +1218,16 @@ def dwconv_tokens(
     weight: (channels, 9) float32. bias: (channels,) float32 or None.
     Returns (B, H*W, channels).
     """
-    B, L, row = x.shape
+    B, L, _ = x.shape  # noqa: N806
     if x.stride(2) != 1 or x.stride(0) != L * x.stride(1):
         raise ValueError("token tensor rows must be contiguous")
     hip = _get_hip()
     out = torch.empty((B, L, channels), device=x.device, dtype=x.dtype)
     chunks = (channels + _SG_CC - 1) // _SG_CC
     hip.launch(
-        hip.get(x.device.index or 0, "spatial_gate", f"dw_tokens_{_DTYPE_SUFFIX[x.dtype]}"),
+        hip.get(
+            x.device.index or 0, "spatial_gate", f"dw_tokens_{_DTYPE_SUFFIX[x.dtype]}"
+        ),
         ((W + _SG_SX - 1) // _SG_SX, (H + _SG_SY - 1) // _SG_SY, B * chunks),
         (256, 1, 1),
         [
@@ -1228,7 +1272,7 @@ def layer_norm(
     computes x + residual and returns (that sum, its LayerNorm); otherwise
     (None, LayerNorm(x)). gamma/beta: float32 contiguous.
     """
-    C = x.shape[-1]
+    C = x.shape[-1]  # noqa: N806
     tokens = x.numel() // C
     out = torch.empty_like(x)
     sum_out = torch.empty_like(x) if residual is not None else None
@@ -1236,7 +1280,9 @@ def layer_norm(
         residual = residual.contiguous()
     hip = _get_hip()
     hip.launch(
-        hip.get(x.device.index or 0, "spatial_gate", f"add_ln_{_DTYPE_SUFFIX[x.dtype]}"),
+        hip.get(
+            x.device.index or 0, "spatial_gate", f"add_ln_{_DTYPE_SUFFIX[x.dtype]}"
+        ),
         ((tokens + 7) // 8, 1, 1),
         (256, 1, 1),
         [
@@ -1270,7 +1316,7 @@ def gate_mix(
     for (B, N, C) tensors a and b, a per-token map tok (B, N, 1) and a
     per-channel map ch (B, 1, C), in one pass.
     """
-    B, N, C = a.shape
+    B, N, C = a.shape  # noqa: N806
     a, b = a.contiguous(), b.contiguous()
     tok = tok.reshape(B, N).to(a.dtype).contiguous()
     ch = ch.reshape(B, C).to(a.dtype).contiguous()
@@ -1278,7 +1324,9 @@ def gate_mix(
     total = a.numel()
     hip = _get_hip()
     hip.launch(
-        hip.get(a.device.index or 0, "spatial_gate", f"gate_mix_{_DTYPE_SUFFIX[a.dtype]}"),
+        hip.get(
+            a.device.index or 0, "spatial_gate", f"gate_mix_{_DTYPE_SUFFIX[a.dtype]}"
+        ),
         (min((total + 255) // 256, 65535), 1, 1),
         (256, 1, 1),
         [

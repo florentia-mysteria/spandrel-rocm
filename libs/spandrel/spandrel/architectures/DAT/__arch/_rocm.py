@@ -30,7 +30,10 @@ _mask_lock = threading.Lock()
 
 
 def cached_mask(
-    module: nn.Module, H: int, W: int, dtype: torch.dtype | None = None  # noqa: N803
+    module: nn.Module,
+    H: int,
+    W: int,
+    dtype: torch.dtype | None = None,  # noqa: N803
 ):
     """
     DAT rebuilds its shifted-window attention masks on the CPU in every shifted
@@ -306,8 +309,12 @@ def _aim_params(module: nn.Module, dtype: torch.dtype):
     ).contiguous()
 
     s_scale, s_shift = _bn_scale_shift(si[1])
-    w1 = si[0].weight.detach().float().reshape(si[0].out_channels, -1) * s_scale[:, None]
-    b1 = (si[0].bias.detach().float() if si[0].bias is not None else 0.0) * s_scale + s_shift
+    w1 = (
+        si[0].weight.detach().float().reshape(si[0].out_channels, -1) * s_scale[:, None]
+    )
+    b1 = (
+        si[0].bias.detach().float() if si[0].bias is not None else 0.0
+    ) * s_scale + s_shift
     w2 = si[3].weight.detach().float().reshape(1, -1)
     b2 = si[3].bias.detach().float() if si[3].bias is not None else None
     params = (
@@ -468,7 +475,9 @@ def adaptive_spatial_attention(module: nn.Module, x, H, W):  # noqa: N803
             module.rg_idx % 2 == 0 and module.b_idx > 0 and (module.b_idx - 2) % 4 == 0
         ) or (module.rg_idx % 2 != 0 and module.b_idx % 4 == 0)
 
-        attened_x = _asa_fused_attention(module, qkv, B, H, W, _H, _W, C, shifted, x.device)
+        attened_x = _asa_fused_attention(
+            module, qkv, B, H, W, _H, _W, C, shifted, x.device
+        )
         if attened_x is None:
             # same as the original
             if pad_r or pad_b:
@@ -516,7 +525,9 @@ def adaptive_spatial_attention(module: nn.Module, x, H, W):  # noqa: N803
         )
         channel_map = _channel_map(module, conv_x)  # B, 1, C
         spatial_map = _spatial_map(attened_x, params)  # B, L, 1
-        x = kernels.gate_mix(attened_x, conv_x, spatial_map, channel_map, a_uses_tok=False)
+        x = kernels.gate_mix(
+            attened_x, conv_x, spatial_map, channel_map, a_uses_tok=False
+        )
         return module.proj_drop(module.proj(x))
     except Exception as e:  # noqa: BLE001
         _aim_failed = True
@@ -549,7 +560,9 @@ def adaptive_channel_attention(module: nn.Module, x, H, W):  # noqa: N803
         )
         channel_map = _channel_map(module, attened_x)  # B, 1, C
         spatial_map = _spatial_map(conv_x, params)  # B, N, 1
-        x = kernels.gate_mix(attened_x, conv_x, spatial_map, channel_map, a_uses_tok=True)
+        x = kernels.gate_mix(
+            attened_x, conv_x, spatial_map, channel_map, a_uses_tok=True
+        )
         return module.proj_drop(module.proj(x))
     except Exception as e:  # noqa: BLE001
         _aim_failed = True
