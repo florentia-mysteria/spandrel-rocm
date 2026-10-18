@@ -13,6 +13,8 @@ from torch.nn import functional as F
 from spandrel.util import store_hyperparameters
 from spandrel.util.timm import DropPath, trunc_normal_
 
+from . import _rocm
+
 
 def img2windows(img, H_sp, W_sp):
     """
@@ -53,6 +55,10 @@ class SpatialGate(nn.Module):
         )  # DW Conv
 
     def forward(self, x, H, W):
+        fast = _rocm.spatial_gate(self, x, H, W)
+        if fast is not None:
+            return fast
+
         # Split
         x1, x2 = x.chunk(2, dim=-1)
         B, _N, C = x.shape
@@ -142,6 +148,9 @@ class DynamicPosBias(nn.Module):
         )
 
     def forward(self, biases):
+        return _rocm.cached_pos_bias(self, biases)
+
+    def _compute(self, biases):
         if self.residual:
             pos = self.pos_proj(biases)  # 2Gh-1 * 2Gw-1, heads
             pos = pos + self.pos1(pos)
@@ -239,6 +248,10 @@ class Spatial_Attention(nn.Module):
         Input: qkv: (B, 3*L, C), H, W, mask: (B, N, N), N is the window size
         Output: x (B, H, W, C)
         """
+        fast = _rocm.spatial_attention(self, qkv, H, W, mask)
+        if fast is not None:
+            return fast
+
         q, k, v = qkv[0], qkv[1], qkv[2]
 
         B, L, C = q.shape
@@ -390,6 +403,9 @@ class Adaptive_Spatial_Attention(nn.Module):
         )
 
     def calculate_mask(self, H, W, dtype=None):
+        return _rocm.cached_mask(self, H, W, dtype)
+
+    def _build_mask(self, H, W, dtype=None):
         # The implementation builds on Swin Transformer code https://github.com/microsoft/Swin-Transformer/blob/main/models/swin_transformer.py
         # calculate attention mask for shift window
         img_mask_0 = torch.zeros((1, H, W, 1), dtype=dtype)  # 1 H W 1 idx=0
@@ -473,6 +489,10 @@ class Adaptive_Spatial_Attention(nn.Module):
         Input: x: (B, H*W, C), H, W
         Output: x: (B, H*W, C)
         """
+        fast = _rocm.adaptive_spatial_attention(self, x, H, W)
+        if fast is not None:
+            return fast
+
         B, L, C = x.shape
         assert L == H * W, "flatten img_tokens has wrong size"
 
@@ -627,6 +647,10 @@ class Adaptive_Channel_Attention(nn.Module):
         Input: x: (B, H*W, C), H, W
         Output: x: (B, H*W, C)
         """
+        fast = _rocm.adaptive_channel_attention(self, x, H, W)
+        if fast is not None:
+            return fast
+
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
         qkv = qkv.permute(2, 0, 3, 1, 4)
@@ -741,6 +765,10 @@ class DATB(nn.Module):
         Input: x: (B, H*W, C), x_size: (H, W)
         Output: x: (B, H*W, C)
         """
+        fast = _rocm.dat_block(self, x, x_size)
+        if fast is not None:
+            return fast
+
         H, W = x_size
         x = x + self.drop_path(self.attn(self.norm1(x), H, W))
         x = x + self.drop_path(self.ffn(self.norm2(x), H, W))
