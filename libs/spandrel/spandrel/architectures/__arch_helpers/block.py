@@ -8,6 +8,8 @@ from typing import Literal
 import torch
 import torch.nn as nn
 
+from . import _rocm_rrdb
+
 ####################
 # Basic blocks
 ####################
@@ -330,6 +332,10 @@ class RRDB(nn.Module):
         )
 
     def forward(self, x):
+        fast = _rocm_rrdb.rrdb_forward(self, x)
+        if fast is not None:
+            return fast
+
         out = self.RDB1(x)
         out = self.RDB2(out)
         out = self.RDB3(out)

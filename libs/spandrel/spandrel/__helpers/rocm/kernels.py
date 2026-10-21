@@ -699,6 +699,88 @@ extern "C" __global__ void __launch_bounds__(256) win_attn_wmma_f16_64(const u16
 extern "C" __global__ void __launch_bounds__(256) win_attn_wmma_f16_16(const u16* qkv, u16* out, WMMA_ARGS) { win_attn_wmma<false, 16>(qkv, WMMA_PASS); }
 """
 
+_RRDB_SRC = r"""
+typedef unsigned short bf16_t;
+
+__device__ __forceinline__ float load_val(const float* p, long i) { return p[i]; }
+__device__ __forceinline__ float load_val(const _Float16* p, long i) { return (float)p[i]; }
+__device__ __forceinline__ float load_val(const bf16_t* p, long i) {
+    return __uint_as_float(((unsigned int)p[i]) << 16);
+}
+__device__ __forceinline__ unsigned short bf16_bits(float v) {
+    unsigned int u = __float_as_uint(v);
+    u += 0x7FFFu + ((u >> 16) & 1u);
+    return (unsigned short)(u >> 16);
+}
+__device__ __forceinline__ void store_val(float* p, long i, float v) { p[i] = v; }
+__device__ __forceinline__ void store_val(_Float16* p, long i, float v) { p[i] = (_Float16)v; }
+__device__ __forceinline__ void store_val(bf16_t* p, long i, float v) { p[i] = bf16_bits(v); }
+
+// Rounds a float to T and back, as PyTorch does after every elementwise op.
+__device__ __forceinline__ float round_to(const float*, float v) { return v; }
+__device__ __forceinline__ float round_to(const _Float16*, float v) { return (float)(_Float16)v; }
+__device__ __forceinline__ float round_to(const bf16_t*, float v) {
+    return __uint_as_float(((unsigned int)bf16_bits(v)) << 16);
+}
+
+// ESRGAN's dense blocks without torch.cat. Every block works in one buffer
+// (B, nf + 4 * gc, H, W) holding [x | x1 | x2 | x3 | x4]; each conv reads a
+// channel prefix of it and these kernels write its output into the next slot.
+// All tensors are NCHW with H*W contiguous per channel; `*_stride` is the
+// per-image element stride (channels of the underlying buffer * H * W).
+// blockIdx.y is the image.
+
+// dst[off:off+C] = act(src), act = LeakyReLU(slope) or ReLU.
+template <typename T>
+__device__ void act_into(const T* __restrict__ src, T* __restrict__ dst, long n,
+                         long dst_stride, long dst_off, float slope, int relu) {
+    const long b = blockIdx.y;
+    const T* s = src + b * n;
+    T* d = dst + b * dst_stride + dst_off;
+    for (long i = (long)blockIdx.x * 256 + threadIdx.x; i < n; i += (long)gridDim.x * 256) {
+        float v = load_val(s, i);
+        store_val(d, i, v > 0.0f ? v : (relu ? 0.0f : v * slope));
+    }
+}
+
+// dst = a * s1 + x1, then optionally * s2 + x2, rounding to T after every
+// multiply and add like the separate PyTorch ops do.
+template <typename T>
+__device__ void res_add(const T* __restrict__ a, const T* __restrict__ x1, long x1_stride,
+                        const T* __restrict__ x2, long x2_stride, T* __restrict__ dst,
+                        long dst_stride, long n, float s1, float s2, int two) {
+    const long b = blockIdx.y;
+    const T* pa = a + b * n;
+    const T* p1 = x1 + b * x1_stride;
+    const T* p2 = two ? x2 + b * x2_stride : nullptr;
+    T* d = dst + b * dst_stride;
+    for (long i = (long)blockIdx.x * 256 + threadIdx.x; i < n; i += (long)gridDim.x * 256) {
+        float t = round_to(d, load_val(pa, i) * s1);
+        t = round_to(d, t + load_val(p1, i));
+        if (two) {
+            t = round_to(d, t * s2);
+            t = round_to(d, t + load_val(p2, i));
+        }
+        store_val(d, i, t);
+    }
+}
+
+#define RRDB_KERNELS(T, S)                                                                   \
+    extern "C" __global__ void act_into_##S(const T* src, T* dst, long n, long dst_stride,   \
+                                            long dst_off, float slope, int relu) {           \
+        act_into<T>(src, dst, n, dst_stride, dst_off, slope, relu);                          \
+    }                                                                                        \
+    extern "C" __global__ void res_add_##S(const T* a, const T* x1, long x1_stride,          \
+                                           const T* x2, long x2_stride, T* dst,              \
+                                           long dst_stride, long n, float s1, float s2,      \
+                                           int two) {                                        \
+        res_add<T>(a, x1, x1_stride, x2, x2_stride, dst, dst_stride, n, s1, s2, two);        \
+    }
+RRDB_KERNELS(float, f32)
+RRDB_KERNELS(_Float16, f16)
+RRDB_KERNELS(bf16_t, bf16)
+"""
+
 _TW, _TH = 32, 16
 _MAX_GRID_Z = 65535
 _DTYPE_SUFFIX = {torch.float32: "f32", torch.float16: "f16", torch.bfloat16: "bf16"}
@@ -723,6 +805,12 @@ _PROGRAMS: dict[str, tuple[str, list[str], list[str]]] = {
         + [f"add_ln_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"gate_mix_{s}" for s in _DTYPE_SUFFIX.values()],
         [],
+    ),
+    # exact PyTorch rounding: no fused multiply-add
+    "rrdb": (
+        _RRDB_SRC,
+        [f"{k}_{s}" for k in ("act_into", "res_add") for s in _DTYPE_SUFFIX.values()],
+        ["-ffp-contract=off"],
     ),
 }
 _LDS_LIMIT = 64 * 1024
@@ -1343,3 +1431,106 @@ def gate_mix(
         _stream(a),
     )
     return out
+
+
+# --- ESRGAN dense blocks -------------------------------------------------------
+
+
+def _image_stride(t: torch.Tensor) -> int | None:
+    """
+    The per-image element stride of an NCHW tensor whose channels each hold a
+    contiguous H*W plane (e.g. a channel prefix of a larger buffer), or None.
+    """
+    _, c, h, w = t.shape
+    if t.stride(3) != 1 or t.stride(2) != w or t.stride(1) != h * w:
+        return None
+    return t.stride(0) if t.shape[0] > 1 else c * h * w
+
+
+def can_rrdb(x: torch.Tensor) -> bool:
+    return (
+        x.is_cuda
+        and x.dim() == 4
+        and x.dtype in _DTYPE_SUFFIX
+        and not x.requires_grad
+        and x.shape[0] <= _MAX_GRID_Z
+        and _image_stride(x) is not None
+    )
+
+
+def _grid(n: int, batch: int) -> tuple[int, int, int]:
+    return (max(1, min((n + 255) // 256, 4096)), batch, 1)
+
+
+def act_into(
+    src: torch.Tensor, dst: torch.Tensor, channel_offset: int, slope: float, relu: bool
+) -> None:
+    """
+    dst[:, channel_offset : channel_offset + C] = LeakyReLU(src) (or ReLU), where
+    dst is an NCHW buffer and src a (B, C, H, W) tensor.
+    """
+    b, c, h, w = src.shape
+    src = src.contiguous()
+    dst_stride = _image_stride(dst)
+    if dst_stride is None:
+        raise ValueError("unsupported destination layout")
+    n = c * h * w
+    hip = _get_hip()
+    hip.launch(
+        hip.get(dst.device.index or 0, "rrdb", f"act_into_{_DTYPE_SUFFIX[src.dtype]}"),
+        _grid(n, b),
+        (256, 1, 1),
+        [
+            ctypes.c_void_p(src.data_ptr()),
+            ctypes.c_void_p(dst.data_ptr()),
+            ctypes.c_int64(n),
+            ctypes.c_int64(dst_stride),
+            ctypes.c_int64(channel_offset * h * w),
+            ctypes.c_float(slope),
+            ctypes.c_int(1 if relu else 0),
+        ],
+        _stream(src),
+    )
+
+
+def residual_add(
+    a: torch.Tensor,
+    x1: torch.Tensor,
+    dst: torch.Tensor,
+    s1: float,
+    x2: torch.Tensor | None = None,
+    s2: float = 0.0,
+) -> None:
+    """
+    dst = a * s1 + x1, then * s2 + x2 if x2 is given, with the rounding of the
+    separate PyTorch ops. a is (B, C, H, W); x1, x2 and dst may be channel
+    prefixes of larger NCHW buffers.
+    """
+    b, c, h, w = a.shape
+    a = a.contiguous()
+    x1_stride = _image_stride(x1)
+    dst_stride = _image_stride(dst)
+    x2_stride = _image_stride(x2) if x2 is not None else 0
+    if x1_stride is None or dst_stride is None or x2_stride is None:
+        raise ValueError("unsupported tensor layout")
+    n = c * h * w
+    hip = _get_hip()
+    hip.launch(
+        hip.get(a.device.index or 0, "rrdb", f"res_add_{_DTYPE_SUFFIX[a.dtype]}"),
+        _grid(n, b),
+        (256, 1, 1),
+        [
+            ctypes.c_void_p(a.data_ptr()),
+            ctypes.c_void_p(x1.data_ptr()),
+            ctypes.c_int64(x1_stride),
+            ctypes.c_void_p(x2.data_ptr() if x2 is not None else 0),
+            ctypes.c_int64(x2_stride),
+            ctypes.c_void_p(dst.data_ptr()),
+            ctypes.c_int64(dst_stride),
+            ctypes.c_int64(n),
+            ctypes.c_float(s1),
+            ctypes.c_float(s2),
+            ctypes.c_int(1 if x2 is not None else 0),
+        ],
+        _stream(a),
+    )
