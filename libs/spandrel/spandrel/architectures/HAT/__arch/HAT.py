@@ -12,6 +12,7 @@ from spandrel.util import store_hyperparameters
 from spandrel.util.timm import to_2tuple, trunc_normal_
 
 from ...__arch_helpers.padding import pad_to_multiple
+from . import _rocm
 
 
 def drop_path(x, drop_prob: float = 0.0, training: bool = False):
@@ -323,6 +324,10 @@ class HAB(nn.Module):
         )
 
     def forward(self, x, x_size, rpi_sa, attn_mask):
+        fast = _rocm.hab_forward(self, x, x_size, rpi_sa)
+        if fast is not None:
+            return fast
+
         h, w = x_size
         b, _, c = x.shape
         # assert seq_len == h * w, "input feature has wrong size"

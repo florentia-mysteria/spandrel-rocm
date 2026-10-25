@@ -484,6 +484,80 @@ extern "C" __global__ void add_ln_f32(const float* x, const float* a, float* sum
 extern "C" __global__ void add_ln_f16(const _Float16* x, const _Float16* a, _Float16* sum_out, _Float16* out, LN_ARGS) { add_ln<_Float16>(x, a, sum_out, out, LN_PASS); }
 extern "C" __global__ void add_ln_bf16(const bf16_t* x, const bf16_t* a, bf16_t* sum_out, bf16_t* out, LN_ARGS) { add_ln<bf16_t>(x, a, sum_out, out, LN_PASS); }
 
+// HAT's HAB residual and second LayerNorm in one pass:
+//   sum = (x + a) + (conv * ca[b, c]) * scale     (each op rounded to T, as in
+//         `shortcut + attn_x + conv_x * conv_scale` with conv_x = conv * ca)
+//   out = LayerNorm(sum)
+// x and a are (B, L, C) token rows; conv is the CAB conv output in the image
+// layout (B, C, L), so a block first stages 32 tokens of all channels in shared
+// memory (coalesced along the tokens) and then works on token rows like add_ln.
+template <typename T>
+__device__ void hab_ln(const T* __restrict__ x, const T* __restrict__ a,
+                       const T* __restrict__ conv, const float* __restrict__ ca,
+                       float scale, T* __restrict__ sum_out, T* __restrict__ out,
+                       const float* __restrict__ gamma, const float* __restrict__ beta,
+                       int C, long L, long tokens, float eps) {
+    __shared__ float tile[256 * 33];
+    const long t0 = (long)blockIdx.x * 32;
+    for (int i = threadIdx.x; i < C * 32; i += 256) {
+        const int c = i / 32, j = i % 32;
+        const long tok = t0 + j;
+        float v = 0.0f;
+        if (tok < tokens) {
+            const long b = tok / L, p = tok - b * L;
+            v = load_val(conv, (b * C + c) * L + p);
+        }
+        tile[c * 33 + j] = v;
+    }
+    __syncthreads();
+
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+    for (int j = wave; j < 32; j += 8) {
+        const long tok = t0 + j;
+        if (tok >= tokens) break;
+        const long b = tok / L;
+        const long row = tok * C;
+        float v[8];
+        float s = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            const int c = lane + 32 * k;
+            float t = 0.0f;
+            if (c < C) {
+                const float cv = round_t(round_t(tile[c * 33 + j] * ca[b * C + c], x) * scale, x);
+                t = round_t(round_t(load_val(x, row + c) + load_val(a, row + c), x) + cv, x);
+            }
+            v[k] = t;
+            s += t;
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_xor(s, o, 32);
+        const float mean = s / C;
+        float q = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            const int c = lane + 32 * k;
+            if (c < C) { const float dv = v[k] - mean; q += dv * dv; }
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) q += __shfl_xor(q, o, 32);
+        const float rstd = rsqrtf(q / C + eps);
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            const int c = lane + 32 * k;
+            if (c < C) {
+                store_val(sum_out, row + c, v[k]);
+                store_val(out, row + c, (v[k] - mean) * rstd * gamma[c] + beta[c]);
+            }
+        }
+    }
+}
+
+#define HAB_SIG(T, S) extern "C" __global__ void hab_ln_##S(const T* x, const T* a, const T* conv, const float* ca, float scale, T* sum_out, T* out, const float* gamma, const float* beta, int C, long L, long tokens, float eps) { hab_ln<T>(x, a, conv, ca, scale, sum_out, out, gamma, beta, C, L, tokens, eps); }
+HAB_SIG(float, f32)
+HAB_SIG(_Float16, f16)
+HAB_SIG(bf16_t, bf16)
+
 // DAT's Adaptive Interaction gating, in one pass over (B, N, C):
 //   out = a * sigmoid(tok[b, n]) + b * sigmoid(ch[b, c])   (a_uses_tok = 1)
 //   out = a * sigmoid(ch[b, c]) + b * sigmoid(tok[b, n])   (a_uses_tok = 0)
@@ -809,7 +883,8 @@ _PROGRAMS: dict[str, tuple[str, list[str], list[str]]] = {
         [f"sg_{k}_{s}" for k in ("stats", "gate") for s in _DTYPE_SUFFIX.values()]
         + [f"dw_tokens_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"add_ln_{s}" for s in _DTYPE_SUFFIX.values()]
-        + [f"gate_mix_{s}" for s in _DTYPE_SUFFIX.values()],
+        + [f"gate_mix_{s}" for s in _DTYPE_SUFFIX.values()]
+        + [f"hab_ln_{s}" for s in _DTYPE_SUFFIX.values()],
         [],
     ),
     # exact PyTorch rounding: no fused multiply-add
@@ -1389,6 +1464,54 @@ def layer_norm(
             ctypes.c_void_p(gamma.data_ptr()),
             ctypes.c_void_p(beta.data_ptr()),
             ctypes.c_int(C),
+            ctypes.c_int64(tokens),
+            ctypes.c_float(eps),
+        ],
+        _stream(x),
+    )
+    return sum_out, out
+
+
+def hab_layer_norm(
+    x: torch.Tensor,
+    a: torch.Tensor,
+    conv: torch.Tensor,
+    ca: torch.Tensor,
+    scale: float,
+    gamma: torch.Tensor,
+    beta: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    HAT's `(x + a) + conv * ca * scale` and its LayerNorm in one pass: returns
+    (sum, LayerNorm(sum)). x, a: contiguous (B, L, C); conv: contiguous
+    (B, C, H, W) with H*W = L; ca: (B, C) float32; gamma/beta: float32.
+    """
+    B, L, C = x.shape  # noqa: N806
+    if C > 256:
+        raise ValueError("too many channels")
+    tokens = B * L
+    a, conv, ca = a.contiguous(), conv.contiguous(), ca.contiguous()
+    sum_out, out = torch.empty_like(x), torch.empty_like(x)
+    hip = _get_hip()
+    hip.launch(
+        hip.get(
+            x.device.index or 0, "spatial_gate", f"hab_ln_{_DTYPE_SUFFIX[x.dtype]}"
+        ),
+        ((tokens + 31) // 32, 1, 1),
+        (256, 1, 1),
+        [
+            ctypes.c_void_p(x.data_ptr()),
+            ctypes.c_void_p(a.data_ptr()),
+            ctypes.c_void_p(conv.data_ptr()),
+            ctypes.c_void_p(ca.data_ptr()),
+            ctypes.c_float(scale),
+            ctypes.c_void_p(sum_out.data_ptr()),
+            ctypes.c_void_p(out.data_ptr()),
+            ctypes.c_void_p(gamma.data_ptr()),
+            ctypes.c_void_p(beta.data_ptr()),
+            ctypes.c_int(C),
+            ctypes.c_int64(L),
             ctypes.c_int64(tokens),
             ctypes.c_float(eps),
         ],
