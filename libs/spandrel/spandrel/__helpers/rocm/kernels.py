@@ -694,10 +694,14 @@ __device__ void win_attn_wmma(const u16* __restrict__ qkv, long s0, long s1, lon
     constexpr int KS = KD / 16;  // k steps over the head dim, and O column tiles
     extern __shared__ unsigned char lds_raw[];
     const int N = H_sp * W_sp;
+    // V^T rows are padded by 8 elements: the staging threads of a wave write
+    // one token's channels, i.e. one column of V^T, and an unpadded row stride
+    // of N * 2 bytes would put all of them in the same LDS bank
+    const int NV = N + 8;
     u16* Ks = (u16*)lds_raw;           // [N][KD]
-    u16* Vt = Ks + N * KD;             // [KD][N]
-    u16* Pb = Vt + N * KD;             // [8 waves][16][16]
-    int* labs = (int*)(Pb + 8 * 256);  // [N]
+    u16* Vt = Ks + N * KD;             // [KD][NV]
+    u16* Pb = Vt + KD * NV;            // [8 waves][2 tiles][16][16]
+    int* labs = (int*)(Pb + 8 * 512);  // [N]
 
     const int nw = W / W_sp, nh = H / H_sp, nW = nh * nw;
     const int h = blockIdx.x % heads;
@@ -705,24 +709,26 @@ __device__ void win_attn_wmma(const u16* __restrict__ qkv, long s0, long s1, lon
     const int b = win / nW, wimg = win % nW;
     const int ih = wimg / nw, iw = wimg % nw;
 
-    // stage K and V^T (zero padded to KD) and the region labels
-    for (int t = threadIdx.x; t < N; t += 256) {
+    // stage K and V^T (zero padded to KD) and the region labels; consecutive
+    // threads read consecutive channels of a token, so the loads coalesce
+    for (int idx = threadIdx.x; idx < N * KD; idx += 256) {
+        const int t = idx / KD, j = idx % KD;
         const int y = ih * H_sp + t / W_sp, x = iw * W_sp + t % W_sp;
-        const int ys = (y + sy) % H, xs = (x + sx) % W;
-        const bool valid = ys < Hc && xs < Wc;  // window padding is zero
-        const long base = (long)b * s1 + ((long)ys * Wc + xs) * s2 + (long)(h * d) * s3;
-        for (int j = 0; j < KD; j++) {
-            const bool in = j < d && valid;
-            Ks[t * KD + j] = in ? qkv[s0 + base + j * s3] : (u16)0;
-            Vt[j * N + t] = in ? qkv[2 * s0 + base + j * s3] : (u16)0;
-        }
-        if (labels) labs[t] = labels[wimg * N + t];
+        int ys = y + sy, xs = x + sx;
+        if (ys >= H) ys -= H;
+        if (xs >= W) xs -= W;
+        const bool in = j < d && ys < Hc && xs < Wc;  // window padding is zero
+        const long base = (long)b * s1 + ((long)ys * Wc + xs) * s2 + (long)(h * d + j) * s3;
+        Ks[t * KD + j] = in ? qkv[s0 + base] : (u16)0;
+        Vt[j * NV + t] = in ? qkv[2 * s0 + base] : (u16)0;
     }
+    if (labels)
+        for (int t = threadIdx.x; t < N; t += 256) labs[t] = labels[wimg * N + t];
     __syncthreads();
 
     const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int col = lane & 15, half = lane >> 4;
-    u16* P = Pb + wave * 256;
+    u16* P = Pb + wave * 512;
 
     for (int qt = wave; qt < N / 16; qt += 8) {
         // A operands for Q: row = query qt*16 + col, k = s*16 + 8*half + i
@@ -754,46 +760,57 @@ __device__ void win_attn_wmma(const u16* __restrict__ qkv, long s0, long s1, lon
         #pragma unroll
         for (int t = 0; t < KS; t++) o[t] = (v8f){0, 0, 0, 0, 0, 0, 0, 0};
 
-        for (int kt = 0; kt < N / 16; kt++) {
-            const int key = kt * 16 + col;
-            v8f sacc = (v8f){0, 0, 0, 0, 0, 0, 0, 0};
+        // two 16-key tiles per step: one row max reduction and one pair of
+        // wave barriers for both; with an odd tile count the second tile of
+        // the last step is masked out
+        const int NT = N / 16;
+        for (int kt = 0; kt < NT; kt += 2) {
+            const bool two = kt + 1 < NT;
+            float sv[2][8];
             #pragma unroll
-            for (int s = 0; s < KS; s++) {
-                const v8s kb = *(const v8s*)(Ks + key * KD + s * 16 + 8 * half);
-                sacc = mma<BF16>(qa[s], kb, sacc);
+            for (int u = 0; u < 2; u++) {
+                if (u == 1 && !two) {
+                    #pragma unroll
+                    for (int i = 0; i < 8; i++) sv[u][i] = -__builtin_inff();
+                    continue;
+                }
+                const int key = (kt + u) * 16 + col;
+                v8f sacc = (v8f){0, 0, 0, 0, 0, 0, 0, 0};
+                #pragma unroll
+                for (int s = 0; s < KS; s++) {
+                    const v8s kb = *(const v8s*)(Ks + key * KD + s * 16 + 8 * half);
+                    sacc = mma<BF16>(qa[s], kb, sacc);
+                }
+                const int klab = labels ? labs[key] : 0;
+                const float* brow = biasT ? biasT + ((long)h * N + key) * N + q0 : nullptr;
+                v4f b0 = {0, 0, 0, 0}, b1 = {0, 0, 0, 0};
+                if (brow) { b0 = *(const v4f*)brow; b1 = *(const v4f*)(brow + 4); }
+                #pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    float v = sacc[i] * scale + (i < 4 ? b0[i] : b1[i - 4]);
+                    if (labels && klab != qlab[i]) v -= 100.0f;
+                    sv[u][i] = v;
+                }
             }
-            float sv[8];
-            const int klab = labels ? labs[key] : 0;
-            const float* brow = biasT ? biasT + ((long)h * N + key) * N + q0 : nullptr;
-            v4f b0 = {0, 0, 0, 0}, b1 = {0, 0, 0, 0};
-            if (brow) { b0 = *(const v4f*)brow; b1 = *(const v4f*)(brow + 4); }
-            #pragma unroll
-            for (int i = 0; i < 8; i++) {
-                float v = sacc[i] * scale + (i < 4 ? b0[i] : b1[i - 4]);
-                if (labels && klab != qlab[i]) v -= 100.0f;
-                sv[i] = v;
-            }
-            // row max / sum across the 16 key columns of this half wave
+            // row max across the 32 keys (16 lanes x 2 tiles) of this half wave
             float corr[8];
             #pragma unroll
             for (int i = 0; i < 8; i++) {
-                float mx = sv[i];
+                float mx = fmaxf(sv[0][i], sv[1][i]);
                 mx = fmaxf(mx, __shfl_xor(mx, 1, 16));
                 mx = fmaxf(mx, __shfl_xor(mx, 2, 16));
                 mx = fmaxf(mx, __shfl_xor(mx, 4, 16));
                 mx = fmaxf(mx, __shfl_xor(mx, 8, 16));
                 const float mn = fmaxf(m[i], mx);
                 corr[i] = __expf(m[i] - mn);
-                const float p = __expf(sv[i] - mn);
-                float ps = p;
-                ps += __shfl_xor(ps, 1, 16);
-                ps += __shfl_xor(ps, 2, 16);
-                ps += __shfl_xor(ps, 4, 16);
-                ps += __shfl_xor(ps, 8, 16);
-                l[i] = l[i] * corr[i] + ps;
+                const float p0 = __expf(sv[0][i] - mn), p1 = __expf(sv[1][i] - mn);
+                // per-lane partial row sum, reduced across the 16 lanes once
+                // at the end (the correction factors are the same for all)
+                l[i] = l[i] * corr[i] + p0 + p1;
                 m[i] = mn;
-                // P[row][key] for the A-layout re-read below
-                P[(8 * half + i) * 16 + col] = BF16 ? f2bf(p) : f2h(p);
+                // P[tile][row][key] for the A-layout re-read below
+                P[(8 * half + i) * 16 + col] = BF16 ? f2bf(p0) : f2h(p0);
+                P[256 + (8 * half + i) * 16 + col] = BF16 ? f2bf(p1) : f2h(p1);
             }
             #pragma unroll
             for (int t = 0; t < KS; t++)
@@ -801,13 +818,18 @@ __device__ void win_attn_wmma(const u16* __restrict__ qkv, long s0, long s1, lon
                 for (int i = 0; i < 8; i++) o[t][i] *= corr[i];
             __builtin_amdgcn_wave_barrier();
             __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "wavefront");
-            // A operand: row = query col, k = key 8*half + i
-            const v8s pa = *(const v8s*)(P + col * 16 + 8 * half);
             #pragma unroll
-            for (int t = 0; t < KS; t++) {
-                // B operand: col = head dim t*16 + col, k = key kt*16 + 8*half + i
-                const v8s vb = *(const v8s*)(Vt + (t * 16 + col) * N + kt * 16 + 8 * half);
-                o[t] = mma<BF16>(pa, vb, o[t]);
+            for (int u = 0; u < 2; u++) {
+                if (u == 1 && !two) break;
+                // A operand: row = query col, k = key 8*half + i
+                const v8s pa = *(const v8s*)(P + u * 256 + col * 16 + 8 * half);
+                #pragma unroll
+                for (int t = 0; t < KS; t++) {
+                    // B operand: col = head dim t*16 + col, k = key (kt+u)*16 + 8*half + i
+                    const v8s vb =
+                        *(const v8s*)(Vt + (t * 16 + col) * NV + (kt + u) * 16 + 8 * half);
+                    o[t] = mma<BF16>(pa, vb, o[t]);
+                }
             }
             __builtin_amdgcn_wave_barrier();
             __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "wavefront");
@@ -819,8 +841,14 @@ __device__ void win_attn_wmma(const u16* __restrict__ qkv, long s0, long s1, lon
             const int n = q0 + i;
             const int y = ih * H_sp + n / W_sp, x = iw * W_sp + n % W_sp;
             const int ys = (y + sy) % H, xs = (x + sx) % W;
+            // reduce before the bounds check, with all 16 lanes active
+            float ls = l[i];
+            ls += __shfl_xor(ls, 1, 16);
+            ls += __shfl_xor(ls, 2, 16);
+            ls += __shfl_xor(ls, 4, 16);
+            ls += __shfl_xor(ls, 8, 16);
             if (ys >= Hc || xs >= Wc) continue;
-            const float inv = 1.0f / l[i];
+            const float inv = 1.0f / ls;
             const long ob = (((long)b * Hc + ys) * Wc + xs) * out_stride + out_off + h * d;
             #pragma unroll
             for (int t = 0; t < KS; t++) {
@@ -873,9 +901,10 @@ __device__ void ocab_wmma(const u16* __restrict__ qkv, long s0, long s1, long s2
     extern __shared__ unsigned char lds_raw[];
     const int NQ = ws * ws, NK = ows * ows, NKp = (NK + 15) / 16 * 16;
     const int pad = (ows - ws) / 2;
+    const int CV = chunk + 8;     // padded V^T rows, see win_attn_wmma
     u16* Ks = (u16*)lds_raw;      // [chunk][KD]
-    u16* Vt = Ks + chunk * KD;    // [KD][chunk]
-    u16* Pb = Vt + chunk * KD;    // [8 waves][16][16]
+    u16* Vt = Ks + chunk * KD;    // [KD][CV]
+    u16* Pb = Vt + KD * CV;       // [8 waves][2 tiles][16][16]
 
     const int nwx = W / ws, nW = (H / ws) * nwx;
     const int h = blockIdx.x % heads;
@@ -886,7 +915,7 @@ __device__ void ocab_wmma(const u16* __restrict__ qkv, long s0, long s1, long s2
 
     const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int col = lane & 15, half = lane >> 4;
-    u16* P = Pb + wave * 256;
+    u16* P = Pb + wave * 512;
     const int ntiles = NQ / 16;
 
     v8s qa[MAXT][KS];
@@ -918,62 +947,65 @@ __device__ void ocab_wmma(const u16* __restrict__ qkv, long s0, long s1, long s2
     for (int c0 = 0; c0 < NKp; c0 += chunk) {
         const int nc = min(chunk, NKp - c0);
         __syncthreads();  // everyone is done with the previous chunk
-        for (int t = threadIdx.x; t < nc; t += 256) {
+        // consecutive threads read consecutive channels of a key (coalesced)
+        for (int idx = threadIdx.x; idx < nc * KD; idx += 256) {
+            const int t = idx / KD, j = idx % KD;
             const int key = c0 + t;
             const int y = ky0 + key / ows, x = kx0 + key % ows;
-            const bool valid = key < NK && y >= 0 && y < H && x >= 0 && x < W;
-            const long base = valid
-                ? (long)b * s1 + ((long)y * W + x) * s2 + (long)(h * d) * s3 : 0;
-            for (int j = 0; j < KD; j++) {
-                const bool in = valid && j < d;
-                Ks[t * KD + j] = in ? qkv[s0 + base + j * s3] : (u16)0;
-                Vt[j * chunk + t] = in ? qkv[2 * s0 + base + j * s3] : (u16)0;
-            }
+            const bool in = j < d && key < NK && y >= 0 && y < H && x >= 0 && x < W;
+            const long base = in ? (long)b * s1 + ((long)y * W + x) * s2 + (long)(h * d + j) * s3 : 0;
+            Ks[t * KD + j] = in ? qkv[s0 + base] : (u16)0;
+            Vt[j * CV + t] = in ? qkv[2 * s0 + base] : (u16)0;
         }
         __syncthreads();
 
+        const int NT = nc / 16;
         #pragma unroll
         for (int tt = 0; tt < MAXT; tt++) {
             const int qt = wave + 8 * tt;
             if (qt >= ntiles) break;
             const int q0 = qt * 16 + 8 * half;
-            for (int kt = 0; kt < nc / 16; kt++) {
-                const int kl = kt * 16 + col, key = c0 + kl;
-                v8f sacc = (v8f){0, 0, 0, 0, 0, 0, 0, 0};
+            // two 16-key tiles per step, as in win_attn_wmma
+            for (int kt = 0; kt < NT; kt += 2) {
+                const bool two = kt + 1 < NT;
+                float sv[2][8];
                 #pragma unroll
-                for (int s = 0; s < KS; s++) {
-                    const v8s kb = *(const v8s*)(Ks + kl * KD + s * 16 + 8 * half);
-                    sacc = mma<BF16>(qa[tt][s], kb, sacc);
-                }
-                float sv[8];
-                if (key < NK) {
-                    const float* brow = biasT + ((long)h * NK + key) * NQ + q0;
-                    const v4f b0 = *(const v4f*)brow, b1 = *(const v4f*)(brow + 4);
+                for (int u = 0; u < 2; u++) {
+                    const int kl = (kt + u) * 16 + col, key = c0 + kl;
+                    if ((u == 1 && !two) || key >= NK) {
+                        #pragma unroll
+                        for (int i = 0; i < 8; i++) sv[u][i] = -__builtin_inff();
+                        if (u == 1 && !two) continue;
+                    }
+                    v8f sacc = (v8f){0, 0, 0, 0, 0, 0, 0, 0};
                     #pragma unroll
-                    for (int i = 0; i < 8; i++) sv[i] = sacc[i] * scale + (i < 4 ? b0[i] : b1[i - 4]);
-                } else {
-                    #pragma unroll
-                    for (int i = 0; i < 8; i++) sv[i] = -__builtin_inff();
+                    for (int s = 0; s < KS; s++) {
+                        const v8s kb = *(const v8s*)(Ks + kl * KD + s * 16 + 8 * half);
+                        sacc = mma<BF16>(qa[tt][s], kb, sacc);
+                    }
+                    if (key < NK) {
+                        const float* brow = biasT + ((long)h * NK + key) * NQ + q0;
+                        const v4f b0 = *(const v4f*)brow, b1 = *(const v4f*)(brow + 4);
+                        #pragma unroll
+                        for (int i = 0; i < 8; i++)
+                            sv[u][i] = sacc[i] * scale + (i < 4 ? b0[i] : b1[i - 4]);
+                    }
                 }
                 float corr[8];
                 #pragma unroll
                 for (int i = 0; i < 8; i++) {
-                    float mx = sv[i];
+                    float mx = fmaxf(sv[0][i], sv[1][i]);
                     mx = fmaxf(mx, __shfl_xor(mx, 1, 16));
                     mx = fmaxf(mx, __shfl_xor(mx, 2, 16));
                     mx = fmaxf(mx, __shfl_xor(mx, 4, 16));
                     mx = fmaxf(mx, __shfl_xor(mx, 8, 16));
                     const float mn = fmaxf(m[tt][i], mx);
                     corr[i] = __expf(m[tt][i] - mn);
-                    const float p = __expf(sv[i] - mn);
-                    float ps = p;
-                    ps += __shfl_xor(ps, 1, 16);
-                    ps += __shfl_xor(ps, 2, 16);
-                    ps += __shfl_xor(ps, 4, 16);
-                    ps += __shfl_xor(ps, 8, 16);
-                    l[tt][i] = l[tt][i] * corr[i] + ps;
+                    const float p0 = __expf(sv[0][i] - mn), p1 = __expf(sv[1][i] - mn);
+                    l[tt][i] = l[tt][i] * corr[i] + p0 + p1;  // per-lane partial sum
                     m[tt][i] = mn;
-                    P[(8 * half + i) * 16 + col] = BF16 ? f2bf(p) : f2h(p);
+                    P[(8 * half + i) * 16 + col] = BF16 ? f2bf(p0) : f2h(p0);
+                    P[256 + (8 * half + i) * 16 + col] = BF16 ? f2bf(p1) : f2h(p1);
                 }
                 #pragma unroll
                 for (int t = 0; t < KS; t++)
@@ -981,11 +1013,16 @@ __device__ void ocab_wmma(const u16* __restrict__ qkv, long s0, long s1, long s2
                     for (int i = 0; i < 8; i++) o[tt][t][i] *= corr[i];
                 __builtin_amdgcn_wave_barrier();
                 __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "wavefront");
-                const v8s pa = *(const v8s*)(P + col * 16 + 8 * half);
                 #pragma unroll
-                for (int t = 0; t < KS; t++) {
-                    const v8s vb = *(const v8s*)(Vt + (t * 16 + col) * chunk + kt * 16 + 8 * half);
-                    o[tt][t] = mma<BF16>(pa, vb, o[tt][t]);
+                for (int u = 0; u < 2; u++) {
+                    if (u == 1 && !two) break;
+                    const v8s pa = *(const v8s*)(P + u * 256 + col * 16 + 8 * half);
+                    #pragma unroll
+                    for (int t = 0; t < KS; t++) {
+                        const v8s vb =
+                            *(const v8s*)(Vt + (t * 16 + col) * CV + (kt + u) * 16 + 8 * half);
+                        o[tt][t] = mma<BF16>(pa, vb, o[tt][t]);
+                    }
                 }
                 __builtin_amdgcn_wave_barrier();
                 __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "wavefront");
@@ -1002,7 +1039,12 @@ __device__ void ocab_wmma(const u16* __restrict__ qkv, long s0, long s1, long s2
         for (int i = 0; i < 8; i++) {
             const int n = q0 + i;
             const int y = iy * ws + n / ws, x = ix * ws + n % ws;
-            const float inv = 1.0f / l[tt][i];
+            float ls = l[tt][i];
+            ls += __shfl_xor(ls, 1, 16);
+            ls += __shfl_xor(ls, 2, 16);
+            ls += __shfl_xor(ls, 4, 16);
+            ls += __shfl_xor(ls, 8, 16);
+            const float inv = 1.0f / ls;
             const long ob = (((long)b * H + y) * W + x) * (long)(heads * d) + h * d;
             #pragma unroll
             for (int t = 0; t < KS; t++) {
@@ -1437,8 +1479,8 @@ def _is_gfx12(device: int) -> bool:
 
 
 def _wmma_lds_bytes(n: int, kd: int) -> int:
-    # must match win_attn_wmma: K [N][KD], V^T [KD][N], 8 P tiles, labels
-    return 2 * n * kd * 2 + 8 * 256 * 2 + n * 4
+    # must match win_attn_wmma: K [N][KD], V^T [KD][N + 8], 8 x 2 P tiles, labels
+    return n * kd * 2 + kd * (n + 8) * 2 + 8 * 512 * 2 + n * 4
 
 
 def _wmma_kd(qkv: torch.Tensor, d: int) -> int:
@@ -1464,9 +1506,14 @@ _OCAB_MAX_QUERIES = 8 * 16 * 2  # 8 waves x 16 rows x MAXT tiles in ocab_wmma
 _ocab_failed = False
 
 
+def _ocab_lds_bytes(chunk: int, kd: int) -> int:
+    # must match ocab_wmma: K [chunk][KD], V^T [KD][chunk + 8], 8 x 2 P tiles
+    return chunk * kd * 2 + kd * (chunk + 8) * 2 + 8 * 512 * 2
+
+
 def _ocab_chunk(n_keys: int, kd: int) -> int:
-    """Keys staged in shared memory at a time: K and V^T, plus 8 P tiles."""
-    fit = (_LDS_LIMIT - 8 * 256 * 2) // (2 * kd * 2) // 16 * 16
+    """Keys staged in shared memory at a time."""
+    fit = (_LDS_LIMIT - 8 * 512 * 2 - kd * 8 * 2) // (2 * kd * 2) // 16 * 16
     return min(fit, (n_keys + 15) // 16 * 16)
 
 
@@ -1547,7 +1594,7 @@ def ocab_attention(
             ctypes.c_int(chunk),
         ],
         _stream(qkv),
-        shared_mem=2 * chunk * kd * 2 + 8 * 256 * 2,
+        shared_mem=_ocab_lds_bytes(chunk, kd),
     )
     return out
 
