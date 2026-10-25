@@ -558,6 +558,68 @@ HAB_SIG(float, f32)
 HAB_SIG(_Float16, f16)
 HAB_SIG(bf16_t, bf16)
 
+// LayerNorm over token rows like add_ln (no residual), also writing the result
+// in the image layout (B, C, L) for a following convolution, which otherwise
+// needs a slow transposing copy. A block normalizes 32 tokens, keeps them in
+// shared memory and writes the image layout coalesced along the tokens.
+template <typename T>
+__device__ void ln_nchw(const T* __restrict__ x, T* __restrict__ out, T* __restrict__ img,
+                        const float* __restrict__ gamma, const float* __restrict__ beta,
+                        int C, long L, long tokens, float eps) {
+    __shared__ float tile[256 * 33];
+    const long t0 = (long)blockIdx.x * 32;
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+    for (int j = wave; j < 32; j += 8) {
+        const long tok = t0 + j;
+        if (tok >= tokens) break;
+        const long row = tok * C;
+        float v[8];
+        float s = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            const int c = lane + 32 * k;
+            const float t = c < C ? load_val(x, row + c) : 0.0f;
+            v[k] = t;
+            s += t;
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_xor(s, o, 32);
+        const float mean = s / C;
+        float q = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            const int c = lane + 32 * k;
+            if (c < C) { const float dv = v[k] - mean; q += dv * dv; }
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) q += __shfl_xor(q, o, 32);
+        const float rstd = rsqrtf(q / C + eps);
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            const int c = lane + 32 * k;
+            if (c < C) {
+                // rounded here, so both stores below convert an exact value
+                const float r = round_t((v[k] - mean) * rstd * gamma[c] + beta[c], x);
+                store_val(out, row + c, r);
+                tile[c * 33 + j] = r;
+            }
+        }
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < C * 32; i += 256) {
+        const int c = i / 32, j = i % 32;
+        const long tok = t0 + j;
+        if (tok >= tokens) continue;
+        const long b = tok / L, p = tok - b * L;
+        store_val(img, (b * C + c) * L + p, tile[c * 33 + j]);
+    }
+}
+
+#define LNI_SIG(T, S) extern "C" __global__ void ln_nchw_##S(const T* x, T* out, T* img, const float* gamma, const float* beta, int C, long L, long tokens, float eps) { ln_nchw<T>(x, out, img, gamma, beta, C, L, tokens, eps); }
+LNI_SIG(float, f32)
+LNI_SIG(_Float16, f16)
+LNI_SIG(bf16_t, bf16)
+
 // DAT's Adaptive Interaction gating, in one pass over (B, N, C):
 //   out = a * sigmoid(tok[b, n]) + b * sigmoid(ch[b, c])   (a_uses_tok = 1)
 //   out = a * sigmoid(ch[b, c]) + b * sigmoid(tok[b, n])   (a_uses_tok = 0)
@@ -1073,7 +1135,8 @@ _PROGRAMS: dict[str, tuple[str, list[str], list[str]]] = {
         + [f"dw_tokens_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"add_ln_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"gate_mix_{s}" for s in _DTYPE_SUFFIX.values()]
-        + [f"hab_ln_{s}" for s in _DTYPE_SUFFIX.values()],
+        + [f"hab_ln_{s}" for s in _DTYPE_SUFFIX.values()]
+        + [f"ln_nchw_{s}" for s in _DTYPE_SUFFIX.values()],
         [],
     ),
     # exact PyTorch rounding: no fused multiply-add
@@ -1756,6 +1819,47 @@ def layer_norm(
         _stream(x),
     )
     return sum_out, out
+
+
+def layer_norm_with_image(
+    x: torch.Tensor,
+    gamma: torch.Tensor,
+    beta: torch.Tensor,
+    eps: float,
+    H: int,  # noqa: N803
+    W: int,  # noqa: N803
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    LayerNorm of contiguous (B, H*W, C) tokens, returned both as tokens and as
+    a contiguous (B, C, H, W) image, bit-identical to permuting the tokens.
+    """
+    B, L, C = x.shape  # noqa: N806
+    if C > 256 or L != H * W:
+        raise ValueError("unsupported shape")
+    tokens = B * L
+    out = torch.empty_like(x)
+    img = torch.empty((B, C, H, W), device=x.device, dtype=x.dtype)
+    hip = _get_hip()
+    hip.launch(
+        hip.get(
+            x.device.index or 0, "spatial_gate", f"ln_nchw_{_DTYPE_SUFFIX[x.dtype]}"
+        ),
+        ((tokens + 31) // 32, 1, 1),
+        (256, 1, 1),
+        [
+            ctypes.c_void_p(x.data_ptr()),
+            ctypes.c_void_p(out.data_ptr()),
+            ctypes.c_void_p(img.data_ptr()),
+            ctypes.c_void_p(gamma.data_ptr()),
+            ctypes.c_void_p(beta.data_ptr()),
+            ctypes.c_int(C),
+            ctypes.c_int64(L),
+            ctypes.c_int64(tokens),
+            ctypes.c_float(eps),
+        ],
+        _stream(x),
+    )
+    return out, img
 
 
 def hab_layer_norm(

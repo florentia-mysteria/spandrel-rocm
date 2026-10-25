@@ -144,7 +144,8 @@ def hab_forward(module: nn.Module, x, x_size, rpi_sa):  # noqa: ANN001
     attn = module.attn
     try:
         g1, b1 = _ln_params(module.norm1)
-        _, n1 = kernels.layer_norm(x, g1, b1, module.norm1.eps)
+        # tokens for the attention, and the same values as an image for CAB
+        n1, n1_img = kernels.layer_norm_with_image(x, g1, b1, module.norm1.eps, h, w)
 
         qkv = attn.qkv(n1).view(b, n, 3, c).permute(2, 0, 1, 3)
         if not kernels.can_window_attention(qkv, h, w, ws, ws, attn.num_heads):
@@ -153,7 +154,7 @@ def hab_forward(module: nn.Module, x, x_size, rpi_sa):  # noqa: ANN001
         # CAB: the convs as in the original, the channel attention is applied
         # by the residual kernel below
         cab = module.conv_block.cab
-        conv = cab[2](cab[1](cab[0](n1.view(b, h, w, c).permute(0, 3, 1, 2))))
+        conv = cab[2](cab[1](cab[0](n1_img)))
         ca = cab[3].attention(conv).view(b, c).float()
 
         labels = _shift_labels(h, w, ws, shift, x.device) if shift > 0 else None
