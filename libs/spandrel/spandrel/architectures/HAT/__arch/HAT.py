@@ -434,6 +434,10 @@ class OCAB(nn.Module):
         )
 
     def forward(self, x, x_size, rpi):
+        fast = _rocm.ocab_forward(self, x, x_size, rpi)
+        if fast is not None:
+            return fast
+
         h, w = x_size
         b, _, c = x.shape
 

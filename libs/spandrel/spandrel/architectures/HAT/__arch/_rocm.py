@@ -182,3 +182,70 @@ def hab_forward(module: nn.Module, x, x_size, rpi_sa):  # noqa: ANN001
         _failed = True
         logger.warning("HIP HAT block failed, falling back: %s", e)
         return None
+
+
+_ocab_failed = False
+
+
+def _ocab_bias_t(block: nn.Module, rpi: torch.Tensor) -> torch.Tensor:
+    """OCAB's relative position bias as float32 (heads, key, query)."""
+    table = block.relative_position_bias_table
+    nq, nk = block.window_size**2, block.overlap_win_size**2
+
+    def build() -> torch.Tensor:
+        rpb = table[rpi.view(-1)].view(nq, nk, -1)  # q k h
+        return rpb.permute(2, 1, 0).float().contiguous()  # h k q
+
+    return _cached(block, "_spandrel_bias_t", [table, rpi], build)
+
+
+def ocab_forward(module: nn.Module, x, x_size, rpi):  # noqa: ANN001
+    """
+    OCAB.forward, or None if this path cannot be used. The overlapping cross
+    attention is one WMMA kernel (RDNA4, 16-bit) that reads the overlapping k/v
+    windows in place instead of unfolding them; the LayerNorms use the HIP
+    kernel with the attention residual fused into the second one.
+    """
+    global _ocab_failed
+    if _ocab_failed or module.training or not kernels.hip_kernels_available():
+        return None
+    x = x.contiguous()
+    h, w = x_size
+    b, n, c = x.shape
+    if n != h * w or not kernels.can_layer_norm(x) or c > 256:
+        return None
+    if not all(
+        isinstance(norm, nn.LayerNorm)
+        and norm.elementwise_affine
+        and norm.bias is not None
+        and tuple(norm.normalized_shape) == (c,)
+        for norm in (module.norm1, module.norm2)
+    ):
+        return None
+    try:
+        g1, b1 = _ln_params(module.norm1)
+        _, n1 = kernels.layer_norm(x, g1, b1, module.norm1.eps)
+        qkv = module.qkv(n1).view(b, n, 3, c).permute(2, 0, 1, 3)
+        ws, ows = module.window_size, module.overlap_win_size
+        if not kernels.can_ocab_attention(qkv, h, w, ws, ows, module.num_heads):
+            return None
+        out = kernels.ocab_attention(
+            qkv,
+            h,
+            w,
+            ws,
+            ows,
+            module.num_heads,
+            float(module.scale),
+            _ocab_bias_t(module, rpi),
+        )
+        g2, b2 = _ln_params(module.norm2)
+        # the original adds proj + shortcut; addition is commutative
+        s, n2 = kernels.layer_norm(
+            x, g2, b2, module.norm2.eps, residual=module.proj(out.view(b, n, c))
+        )
+        return s + module.mlp(n2)
+    except Exception as e:  # noqa: BLE001
+        _ocab_failed = True
+        logger.warning("HIP OCAB kernel failed, falling back: %s", e)
+        return None
