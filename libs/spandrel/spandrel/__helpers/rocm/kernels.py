@@ -361,7 +361,8 @@ extern "C" __global__ void sg_gate_f16(const _Float16* x, _Float16* out, SG_ARGS
 extern "C" __global__ void sg_gate_bf16(const bf16_t* x, bf16_t* out, SG_ARGS, int C, int H, int W) { sg_gate<bf16_t>(x, SG_PASS, out, C, H, W); }
 
 // Depthwise 3x3 conv (zero padded) in the token layout, with an optional exact
-// GELU. Reads channel c of token t at x[t * row_stride + ch_offset + c], so it
+// GELU on the output (gelu & 1) and/or on the input (gelu & 2, rounded to T
+// like a separate PyTorch GELU before the conv). Reads channel c of token t at x[t * row_stride + ch_offset + c], so it
 // can take e.g. the v part of a (B, L, 3C) qkv buffer directly, and writes a
 // contiguous (B, L, C). Same tiling as sg_gate.
 template <typename T>
@@ -382,6 +383,11 @@ __device__ void dw_tokens(const T* __restrict__ x, long row_stride, int ch_offse
         if (gy >= 0 && gy < H && gx >= 0 && gx < W && c0 + c < C) {
             const long tok = (long)b * L + (long)gy * W + gx;
             v = load_val(x, tok * row_stride + ch_offset + c0 + c);
+            if (gelu & 2) {
+                T r;
+                store_val(&r, 0, 0.5f * v * (1.0f + erff(v * 0.70710678118654752f)));
+                v = load_val(&r, 0);
+            }
         }
         tile[i] = v;
     }
@@ -405,7 +411,7 @@ __device__ void dw_tokens(const T* __restrict__ x, long row_stride, int ch_offse
             #pragma unroll
             for (int j = 0; j < 3; j++)
                 acc += k[i * 3 + j] * tile[((ty + i) * (SX + 2) + tx + j) * CC + c];
-        if (gelu) acc = 0.5f * acc * (1.0f + erff(acc * 0.70710678118654752f));
+        if (gelu & 1) acc = 0.5f * acc * (1.0f + erff(acc * 0.70710678118654752f));
         const long tok = (long)b * L + (long)oy * W + ox;
         store_val(out, tok * C + c0 + c, acc);
     }
@@ -1298,10 +1304,12 @@ def dwconv_tokens(
     weight: torch.Tensor,
     bias: torch.Tensor | None,
     gelu: bool,
+    gelu_in: bool = False,
 ) -> torch.Tensor:
     """
     Depthwise 3x3 conv on channels [ch_offset, ch_offset + channels) of a
-    (B, H*W, row) token tensor with contiguous rows, optionally followed by GELU.
+    (B, H*W, row) token tensor with contiguous rows, optionally followed by GELU
+    and/or preceded by GELU (gelu_in).
 
     weight: (channels, 9) float32. bias: (channels,) float32 or None.
     Returns (B, H*W, channels).
@@ -1325,7 +1333,7 @@ def dwconv_tokens(
             ctypes.c_int(ch_offset),
             ctypes.c_void_p(weight.data_ptr()),
             ctypes.c_void_p(bias.data_ptr() if bias is not None else 0),
-            ctypes.c_int(1 if gelu else 0),
+            ctypes.c_int((1 if gelu else 0) | (2 if gelu_in else 0)),
             ctypes.c_int(channels),
             ctypes.c_int(H),
             ctypes.c_int(W),

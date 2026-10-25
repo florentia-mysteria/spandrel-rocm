@@ -16,6 +16,8 @@ from spandrel.__helpers.model_descriptor import StateDict
 from spandrel.util import store_hyperparameters
 from spandrel.util.timm import DropPath
 
+from . import _rocm
+
 SampleMods = Literal[
     "conv",
     "pixelshuffledirect",
@@ -596,6 +598,10 @@ class SimplifiedDATBlock(nn.Module):
         )
 
     def forward(self, x, H, W):
+        fast = _rocm.fdat_block(self, x, H, W)
+        if fast is not None:
+            return fast
+
         n1 = self.n1(x)
         itype = (
             "channel_modulates_spatial"
