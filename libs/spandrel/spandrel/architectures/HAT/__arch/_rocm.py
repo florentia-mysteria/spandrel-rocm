@@ -10,15 +10,25 @@ Faster inference path for HAT's hybrid attention block (HAB) on ROCm.
   channel attention on the fly: no permute copy and no separate passes.
 - The first LayerNorm uses the HIP kernel too.
 
-The CAB convolutions stay on MIOpen. Returns None when it cannot be used, and
-HAT.py runs its original code. OCAB is unchanged.
+The CAB convolutions stay on MIOpen. For bf16 models they run in fp16, which
+MIOpen does 3-6x faster than bf16 on Radeon cards: the LayerNorm writes their
+input image in fp16 (bf16 values convert exactly), GELU runs in fp16 too, the
+channel attention in fp32, and the residual kernel reads the fp16 output. fp16
+keeps more mantissa bits than bf16, and the CAB values stay far below its
+range limit (they follow a LayerNorm; up to ~3e3 seen in HAT-L, fp16 max is
+65504). The residual stream itself is not touched: it exceeds the fp16 range.
+Set SPANDREL_BF16_CONV_FP16=0 to keep these convs in bf16.
+
+Returns None when it cannot be used, and HAT.py runs its original code.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 
 import torch
+import torch.nn.functional as F  # noqa: N812
 from torch import nn
 
 from spandrel.__helpers.rocm import kernels
@@ -89,6 +99,50 @@ def _shift_labels(H: int, W: int, ws: int, shift: int, device: torch.device):  #
     return labels
 
 
+_cab_fp16 = os.environ.get("SPANDREL_BF16_CONV_FP16", "").strip() != "0"
+
+
+def _conv_params(conv: nn.Conv2d, dtype: torch.dtype):  # noqa: ANN202
+    tensors = [conv.weight] + ([conv.bias] if conv.bias is not None else [])
+    return _cached(
+        conv,
+        f"_spandrel_{dtype}",
+        tensors,
+        lambda: (
+            conv.weight.detach().to(dtype).contiguous(),
+            conv.bias.detach().to(dtype) if conv.bias is not None else None,
+        ),
+    )
+
+
+def _cab_fp16_forward(cab: nn.Module, img: torch.Tensor):  # noqa: ANN202
+    """CAB's convs on an fp16 image, and its channel attention as (B, C) fp32."""
+    w0, b0 = _conv_params(cab[0], torch.float16)
+    w2, b2 = _conv_params(cab[2], torch.float16)
+    conv = F.conv2d(cab[1](F.conv2d(img, w0, b0, padding=1)), w2, b2, padding=1)
+    att = cab[3].attention
+    wa, ba = _conv_params(att[1], torch.float32)
+    wb, bb = _conv_params(att[3], torch.float32)
+    y = conv.mean((2, 3), keepdim=True, dtype=torch.float32)
+    y = torch.sigmoid(F.conv2d(F.relu(F.conv2d(y, wa, ba)), wb, bb))
+    return conv, y.view(y.shape[0], -1)
+
+
+def _cab_attention_ok(cab: nn.Module) -> bool:
+    att = cab[3].attention
+    return (
+        len(att) == 5
+        and isinstance(att[0], nn.AdaptiveAvgPool2d)
+        and att[0].output_size in (1, (1, 1))
+        and isinstance(att[1], nn.Conv2d)
+        and att[1].kernel_size == (1, 1)
+        and isinstance(att[2], nn.ReLU)
+        and isinstance(att[3], nn.Conv2d)
+        and att[3].kernel_size == (1, 1)
+        and isinstance(att[4], nn.Sigmoid)
+    )
+
+
 def _is_conv3x3(m: nn.Module) -> bool:
     return (
         isinstance(m, nn.Conv2d)
@@ -139,23 +193,42 @@ def hab_forward(module: nn.Module, x, x_size, rpi_sa):  # noqa: ANN001
     if supported is None:
         supported = _supported(module, c)
         module.__dict__["_spandrel_supported"] = supported
+        module.__dict__["_spandrel_cab_fp16_ok"] = (
+            supported
+            and isinstance(module.conv_block.cab[1], nn.GELU)
+            and all(
+                cab.padding_mode == "zeros" and cab.dilation == (1, 1)
+                for cab in (module.conv_block.cab[0], module.conv_block.cab[2])
+            )
+            and _cab_attention_ok(module.conv_block.cab)
+        )
     if not supported or n != h * w or h % ws or w % ws:
         return None
     attn = module.attn
     try:
         g1, b1 = _ln_params(module.norm1)
         # tokens for the attention, and the same values as an image for CAB
-        n1, n1_img = kernels.layer_norm_with_image(x, g1, b1, module.norm1.eps, h, w)
+        cab = module.conv_block.cab
+        fp16 = (
+            _cab_fp16
+            and x.dtype == torch.bfloat16
+            and module.__dict__.get("_spandrel_cab_fp16_ok", False)
+        )
+        n1, n1_img = kernels.layer_norm_with_image(
+            x, g1, b1, module.norm1.eps, h, w, image_fp16=fp16
+        )
 
         qkv = attn.qkv(n1).view(b, n, 3, c).permute(2, 0, 1, 3)
         if not kernels.can_window_attention(qkv, h, w, ws, ws, attn.num_heads):
             return None
 
-        # CAB: the convs as in the original, the channel attention is applied
-        # by the residual kernel below
-        cab = module.conv_block.cab
-        conv = cab[2](cab[1](cab[0](n1_img)))
-        ca = cab[3].attention(conv).view(b, c).float()
+        # CAB: the convs as in the original (or fp16, see above), the channel
+        # attention is applied by the residual kernel below
+        if fp16:
+            conv, ca = _cab_fp16_forward(cab, n1_img)
+        else:
+            conv = cab[2](cab[1](cab[0](n1_img)))
+            ca = cab[3].attention(conv).view(b, c).float()
 
         labels = _shift_labels(h, w, ws, shift, x.device) if shift > 0 else None
         out = torch.empty((b, h, w, c), device=x.device, dtype=x.dtype)

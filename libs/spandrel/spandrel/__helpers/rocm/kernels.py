@@ -491,9 +491,10 @@ extern "C" __global__ void add_ln_bf16(const bf16_t* x, const bf16_t* a, bf16_t*
 // x and a are (B, L, C) token rows; conv is the CAB conv output in the image
 // layout (B, C, L), so a block first stages 32 tokens of all channels in shared
 // memory (coalesced along the tokens) and then works on token rows like add_ln.
-template <typename T>
+// conv may be fp16 for a bf16 model (the convs run in fp16, see HAT/_rocm.py).
+template <typename T, typename TC = T>
 __device__ void hab_ln(const T* __restrict__ x, const T* __restrict__ a,
-                       const T* __restrict__ conv, const float* __restrict__ ca,
+                       const TC* __restrict__ conv, const float* __restrict__ ca,
                        float scale, T* __restrict__ sum_out, T* __restrict__ out,
                        const float* __restrict__ gamma, const float* __restrict__ beta,
                        int C, long L, long tokens, float eps) {
@@ -557,13 +558,15 @@ __device__ void hab_ln(const T* __restrict__ x, const T* __restrict__ a,
 HAB_SIG(float, f32)
 HAB_SIG(_Float16, f16)
 HAB_SIG(bf16_t, bf16)
+extern "C" __global__ void hab_ln_bf16_c16(const bf16_t* x, const bf16_t* a, const _Float16* conv, const float* ca, float scale, bf16_t* sum_out, bf16_t* out, const float* gamma, const float* beta, int C, long L, long tokens, float eps) { hab_ln<bf16_t, _Float16>(x, a, conv, ca, scale, sum_out, out, gamma, beta, C, L, tokens, eps); }
 
 // LayerNorm over token rows like add_ln (no residual), also writing the result
 // in the image layout (B, C, L) for a following convolution, which otherwise
 // needs a slow transposing copy. A block normalizes 32 tokens, keeps them in
-// shared memory and writes the image layout coalesced along the tokens.
-template <typename T>
-__device__ void ln_nchw(const T* __restrict__ x, T* __restrict__ out, T* __restrict__ img,
+// shared memory and writes the image layout coalesced along the tokens. The
+// image may be fp16 for a bf16 model: the rounded bf16 values convert exactly.
+template <typename T, typename TI = T>
+__device__ void ln_nchw(const T* __restrict__ x, T* __restrict__ out, TI* __restrict__ img,
                         const float* __restrict__ gamma, const float* __restrict__ beta,
                         int C, long L, long tokens, float eps) {
     __shared__ float tile[256 * 33];
@@ -619,6 +622,7 @@ __device__ void ln_nchw(const T* __restrict__ x, T* __restrict__ out, T* __restr
 LNI_SIG(float, f32)
 LNI_SIG(_Float16, f16)
 LNI_SIG(bf16_t, bf16)
+extern "C" __global__ void ln_nchw_bf16_i16(const bf16_t* x, bf16_t* out, _Float16* img, const float* gamma, const float* beta, int C, long L, long tokens, float eps) { ln_nchw<bf16_t, _Float16>(x, out, img, gamma, beta, C, L, tokens, eps); }
 
 // DAT's Adaptive Interaction gating, in one pass over (B, N, C):
 //   out = a * sigmoid(tok[b, n]) + b * sigmoid(ch[b, c])   (a_uses_tok = 1)
@@ -1178,7 +1182,8 @@ _PROGRAMS: dict[str, tuple[str, list[str], list[str]]] = {
         + [f"add_ln_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"gate_mix_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"hab_ln_{s}" for s in _DTYPE_SUFFIX.values()]
-        + [f"ln_nchw_{s}" for s in _DTYPE_SUFFIX.values()],
+        + [f"ln_nchw_{s}" for s in _DTYPE_SUFFIX.values()]
+        + ["hab_ln_bf16_c16", "ln_nchw_bf16_i16"],
         [],
     ),
     # exact PyTorch rounding: no fused multiply-add
@@ -1875,22 +1880,28 @@ def layer_norm_with_image(
     eps: float,
     H: int,  # noqa: N803
     W: int,  # noqa: N803
+    image_fp16: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     LayerNorm of contiguous (B, H*W, C) tokens, returned both as tokens and as
     a contiguous (B, C, H, W) image, bit-identical to permuting the tokens.
+    image_fp16 (bf16 x only): the image is fp16, holding the same values.
     """
     B, L, C = x.shape  # noqa: N806
     if C > 256 or L != H * W:
         raise ValueError("unsupported shape")
     tokens = B * L
     out = torch.empty_like(x)
-    img = torch.empty((B, C, H, W), device=x.device, dtype=x.dtype)
+    name = f"ln_nchw_{_DTYPE_SUFFIX[x.dtype]}"
+    img_dtype = x.dtype
+    if image_fp16:
+        if x.dtype != torch.bfloat16:
+            raise ValueError("image_fp16 needs a bf16 input")
+        name, img_dtype = "ln_nchw_bf16_i16", torch.float16
+    img = torch.empty((B, C, H, W), device=x.device, dtype=img_dtype)
     hip = _get_hip()
     hip.launch(
-        hip.get(
-            x.device.index or 0, "spatial_gate", f"ln_nchw_{_DTYPE_SUFFIX[x.dtype]}"
-        ),
+        hip.get(x.device.index or 0, "spatial_gate", name),
         ((tokens + 31) // 32, 1, 1),
         (256, 1, 1),
         [
@@ -1922,19 +1933,23 @@ def hab_layer_norm(
     """
     HAT's `(x + a) + conv * ca * scale` and its LayerNorm in one pass: returns
     (sum, LayerNorm(sum)). x, a: contiguous (B, L, C); conv: contiguous
-    (B, C, H, W) with H*W = L; ca: (B, C) float32; gamma/beta: float32.
+    (B, C, H, W) with H*W = L, of x's dtype or fp16 for a bf16 x; ca: (B, C)
+    float32; gamma/beta: float32.
     """
     B, L, C = x.shape  # noqa: N806
     if C > 256:
         raise ValueError("too many channels")
     tokens = B * L
     a, conv, ca = a.contiguous(), conv.contiguous(), ca.contiguous()
+    name = f"hab_ln_{_DTYPE_SUFFIX[x.dtype]}"
+    if conv.dtype != x.dtype:
+        if (x.dtype, conv.dtype) != (torch.bfloat16, torch.float16):
+            raise ValueError("unsupported conv dtype")
+        name = "hab_ln_bf16_c16"
     sum_out, out = torch.empty_like(x), torch.empty_like(x)
     hip = _get_hip()
     hip.launch(
-        hip.get(
-            x.device.index or 0, "spatial_gate", f"hab_ln_{_DTYPE_SUFFIX[x.dtype]}"
-        ),
+        hip.get(x.device.index or 0, "spatial_gate", name),
         ((tokens + 31) // 32, 1, 1),
         (256, 1, 1),
         [
