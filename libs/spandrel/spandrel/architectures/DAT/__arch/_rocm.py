@@ -10,6 +10,7 @@ kernel failure disables that path for the rest of the process.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 
 import torch
@@ -25,6 +26,9 @@ logger = logging.getLogger("spandrel.rocm")
 
 # A single entry: all blocks of a model share it, and consecutive tiles almost
 # always have the same size.
+# for comparisons: SPANDREL_DAT_CHAN_ATTN=0 runs the original channel attention
+_chan_attn = os.environ.get("SPANDREL_DAT_CHAN_ATTN", "").strip() != "0"
+
 _mask_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 _mask_lock = threading.Lock()
 
@@ -535,6 +539,36 @@ def adaptive_spatial_attention(module: nn.Module, x, H, W):  # noqa: N803
         return None
 
 
+def _fused_channel_attention(module: nn.Module, qkv_lin: torch.Tensor):
+    """
+    The channel attention of Adaptive_Channel_Attention in the token layout,
+    or None if the kernel cannot be used. One kernel reads q and k once for the
+    per-head q^T k and the norms over the tokens (instead of normalizing q and
+    k and a GEMM with K = tokens); normalization, temperature and softmax run
+    on the d x d matrices in float32, and attn @ v becomes one GEMM of the
+    strided v with the block diagonal of attn, written straight in the token
+    layout (no permute copy).
+    """
+    heads = module.num_heads
+    if not _chan_attn or not kernels.can_channel_gram(qkv_lin, heads):
+        return None
+    B, N, C3 = qkv_lin.shape  # noqa: N806
+    C = C3 // 3  # noqa: N806
+    d = C // heads
+    gram, nq, nk = kernels.channel_gram(qkv_lin, heads)
+    nq = nq.clamp_min(1e-12).view(B, heads, d, 1)
+    nk = nk.clamp_min(1e-12).view(B, heads, 1, d)
+    a = (gram / (nq * nk) * module.temperature.float()).softmax(-1)
+    # m[b, h*d + i, h*d + j] = a[b, h, i, j]
+    m = a.new_zeros(B, heads, d, heads, d)
+    m.diagonal(dim1=1, dim2=3).copy_(a.permute(0, 2, 3, 1))
+    m = m.view(B, C, C).to(qkv_lin.dtype)
+    v = qkv_lin[:, :, 2 * C :]
+    if B == 1:
+        return F.linear(v[0], m[0]).unsqueeze(0)
+    return v @ m.transpose(1, 2)
+
+
 def adaptive_channel_attention(module: nn.Module, x, H, W):  # noqa: N803
     """See adaptive_spatial_attention."""
     global _aim_failed
@@ -544,15 +578,21 @@ def adaptive_channel_attention(module: nn.Module, x, H, W):  # noqa: N803
         B, N, C = x.shape
         heads = module.num_heads
         qkv_lin = module.qkv(x)  # B, N, 3C
-        q = qkv_lin[..., :C].view(B, N, heads, C // heads).permute(0, 2, 3, 1)
-        k = qkv_lin[..., C : 2 * C].view(B, N, heads, C // heads).permute(0, 2, 3, 1)
-        v = qkv_lin[..., 2 * C :].view(B, N, heads, C // heads).permute(0, 2, 3, 1)
+        attened_x = _fused_channel_attention(module, qkv_lin)
+        if attened_x is None:
+            q = qkv_lin[..., :C].view(B, N, heads, C // heads).permute(0, 2, 3, 1)
+            k = (
+                qkv_lin[..., C : 2 * C]
+                .view(B, N, heads, C // heads)
+                .permute(0, 2, 3, 1)
+            )
+            v = qkv_lin[..., 2 * C :].view(B, N, heads, C // heads).permute(0, 2, 3, 1)
 
-        q = F.normalize(q, dim=-1)
-        k = F.normalize(k, dim=-1)
-        attn = (q @ k.transpose(-2, -1)) * module.temperature
-        attn = module.attn_drop(attn.softmax(dim=-1))
-        attened_x = (attn @ v).permute(0, 3, 1, 2).reshape(B, N, C)
+            q = F.normalize(q, dim=-1)
+            k = F.normalize(k, dim=-1)
+            attn = (q @ k.transpose(-2, -1)) * module.temperature
+            attn = module.attn_drop(attn.softmax(dim=-1))
+            attened_x = (attn @ v).permute(0, 3, 1, 2).reshape(B, N, C)
 
         params = _aim_params(module, x.dtype)
         conv_x = kernels.dwconv_tokens(
