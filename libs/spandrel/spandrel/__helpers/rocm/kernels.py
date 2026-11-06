@@ -265,9 +265,10 @@ __device__ __forceinline__ void store_val(bf16_t* p, long i, float v) {
 
 // Kernel A: LayerNorm statistics of x2, one (mean, rstd) pair per token.
 // 8 tokens per 256-thread block, 32 threads per token.
+// gelu_in: the statistics of GELU(x2), rounded to T like a separate GELU.
 template <typename T>
 __device__ void sg_stats(const T* __restrict__ x, int C, long tokens, float eps,
-                         float* __restrict__ stats) {
+                         float* __restrict__ stats, int gelu_in) {
     __shared__ float s1[256], s2[256];
     const int lane = threadIdx.x & 31;
     const long tok = (long)blockIdx.x * 8 + (threadIdx.x >> 5);
@@ -276,6 +277,11 @@ __device__ void sg_stats(const T* __restrict__ x, int C, long tokens, float eps,
         const T* row = x + tok * (2L * C) + C;
         for (int c = lane; c < C; c += 32) {
             float v = load_val(row, c);
+            if (gelu_in) {
+                T r;
+                store_val(&r, 0, 0.5f * v * (1.0f + erff(v * 0.70710678118654752f)));
+                v = load_val(&r, 0);
+            }
             a += v;
             q += v * v;
         }
@@ -352,9 +358,9 @@ __device__ void sg_gate(const T* __restrict__ x, const float* __restrict__ stats
     }
 }
 
-extern "C" __global__ void sg_stats_f32(const float* x, int C, long tokens, float eps, float* stats) { sg_stats<float>(x, C, tokens, eps, stats); }
-extern "C" __global__ void sg_stats_f16(const _Float16* x, int C, long tokens, float eps, float* stats) { sg_stats<_Float16>(x, C, tokens, eps, stats); }
-extern "C" __global__ void sg_stats_bf16(const bf16_t* x, int C, long tokens, float eps, float* stats) { sg_stats<bf16_t>(x, C, tokens, eps, stats); }
+extern "C" __global__ void sg_stats_f32(const float* x, int C, long tokens, float eps, float* stats, int gelu_in) { sg_stats<float>(x, C, tokens, eps, stats, gelu_in); }
+extern "C" __global__ void sg_stats_f16(const _Float16* x, int C, long tokens, float eps, float* stats, int gelu_in) { sg_stats<_Float16>(x, C, tokens, eps, stats, gelu_in); }
+extern "C" __global__ void sg_stats_bf16(const bf16_t* x, int C, long tokens, float eps, float* stats, int gelu_in) { sg_stats<bf16_t>(x, C, tokens, eps, stats, gelu_in); }
 #define SG_ARGS const float* stats, const float* gamma, const float* beta, const float* w, const float* bias
 #define SG_PASS stats, gamma, beta, w, bias
 extern "C" __global__ void sg_gate_f32(const float* x, float* out, SG_ARGS, int C, int H, int W) { sg_gate<float>(x, SG_PASS, out, C, H, W); }
@@ -488,10 +494,31 @@ __device__ __forceinline__ float4 dwv_in(const float v[4], int gelu_in) {
     return make_float4(g[0], g[1], g[2], g[3]);
 }
 
+// LayerNorm of a loaded value from its token's (mean, rstd); positions outside
+// the image stay zero (the conv's zero padding comes after the norm)
+__device__ __forceinline__ float4 dwv_norm(float4 v, const float* __restrict__ stats,
+                                           const float* __restrict__ gamma,
+                                           const float* __restrict__ beta, int c, long tok,
+                                           bool inside) {
+    if (!stats || !inside) return v;
+    const float mean = stats[tok * 2], rstd = stats[tok * 2 + 1];
+    return make_float4((v.x - mean) * rstd * gamma[c] + beta[c],
+                       (v.y - mean) * rstd * gamma[c + 1] + beta[c + 1],
+                       (v.z - mean) * rstd * gamma[c + 2] + beta[c + 2],
+                       (v.w - mean) * rstd * gamma[c + 3] + beta[c + 3]);
+}
+
+// With stats (and gamma, beta), the input is layer-normalized while loading;
+// with gate_off >= 0, the output is multiplied by channels
+// [gate_off, gate_off + C) of the same token (GELU'd too with gelu & 2): that
+// is DAT's SpatialGate, x1 * dwconv(LayerNorm(x2)), on (B, L, 2C) rows.
 template <typename T>
 __device__ void dw_tokens_v(const T* __restrict__ x, long row_stride, int ch_offset,
                             const float* __restrict__ w, const float* __restrict__ bias,
-                            int gelu, T* __restrict__ out, int C, int H, int W) {
+                            int gelu, T* __restrict__ out, int C, int H, int W,
+                            const float* __restrict__ stats = nullptr,
+                            const float* __restrict__ gamma = nullptr,
+                            const float* __restrict__ beta = nullptr, int gate_off = -1) {
     __shared__ float4 row[2][DWV_TX + 2][DWV_CV];
     const int vecs = C / 4;
     const int chunks = (vecs + DWV_CV - 1) / DWV_CV;
@@ -531,10 +558,16 @@ __device__ void dw_tokens_v(const T* __restrict__ x, long row_stride, int ch_off
     float m[4], h[4];
     dwv_load(xb, row_stride, base, y0 - 1, mx, H, W, m);
     if (hx != -2) dwv_load(xb, row_stride, base, y0 - 1, hxx, H, W, h);
+    const long tok_row = (long)b * L;
     for (int y = y0 - 1; y <= y_end; y++) {
         float4 (*buf)[DWV_CV] = row[y & 1];
-        buf[tx + 1][lv] = dwv_in<T>(m, gin);
-        if (hx != -2) buf[tx == 0 ? 0 : DWV_TX + 1][lv] = dwv_in<T>(h, gin);
+        const bool y_in = y >= 0 && y < H;
+        buf[tx + 1][lv] = dwv_norm(dwv_in<T>(m, gin), stats, gamma, beta, c,
+                                   tok_row + (long)y * W + mx, y_in && mx >= 0 && mx < W);
+        if (hx != -2)
+            buf[tx == 0 ? 0 : DWV_TX + 1][lv] =
+                dwv_norm(dwv_in<T>(h, gin), stats, gamma, beta, c,
+                         tok_row + (long)y * W + hxx, y_in && hxx >= 0 && hxx < W);
         if (y < y_end) {
             dwv_load(xb, row_stride, base, y + 1, mx, H, W, m);
             if (hx != -2) dwv_load(xb, row_stride, base, y + 1, hxx, H, W, h);
@@ -558,6 +591,12 @@ __device__ void dw_tokens_v(const T* __restrict__ x, long row_stride, int ch_off
                 #pragma unroll
                 for (int j = 0; j < 4; j++) o[j] = 0.5f * o[j] * (1.0f + erff(o[j] * 0.70710678118654752f));
             }
+            if (gate_off >= 0) {
+                float g[4];
+                load4(xb, ((long)(y - 1) * W + ox) * row_stride + gate_off + c, g);
+                const float4 gq = dwv_in<T>(g, gin);
+                o[0] *= gq.x; o[1] *= gq.y; o[2] *= gq.z; o[3] *= gq.w;
+            }
             store4(ob, ((long)(y - 1) * W + ox) * C + c, o);
         }
     }
@@ -566,6 +605,11 @@ __device__ void dw_tokens_v(const T* __restrict__ x, long row_stride, int ch_off
 extern "C" __global__ void __launch_bounds__(256) dw_tokens_v_f32(const float* x, float* out, DWT_ARGS, int C, int H, int W) { dw_tokens_v<float>(x, DWT_PASS, out, C, H, W); }
 extern "C" __global__ void __launch_bounds__(256) dw_tokens_v_f16(const _Float16* x, _Float16* out, DWT_ARGS, int C, int H, int W) { dw_tokens_v<_Float16>(x, DWT_PASS, out, C, H, W); }
 extern "C" __global__ void __launch_bounds__(256) dw_tokens_v_bf16(const bf16_t* x, bf16_t* out, DWT_ARGS, int C, int H, int W) { dw_tokens_v<bf16_t>(x, DWT_PASS, out, C, H, W); }
+#define SGV_ARGS const float* stats, const float* gamma, const float* beta, int gate_off
+#define SGV_PASS stats, gamma, beta, gate_off
+extern "C" __global__ void __launch_bounds__(256) sg_gate_v_f32(const float* x, float* out, DWT_ARGS, int C, int H, int W, SGV_ARGS) { dw_tokens_v<float>(x, DWT_PASS, out, C, H, W, SGV_PASS); }
+extern "C" __global__ void __launch_bounds__(256) sg_gate_v_f16(const _Float16* x, _Float16* out, DWT_ARGS, int C, int H, int W, SGV_ARGS) { dw_tokens_v<_Float16>(x, DWT_PASS, out, C, H, W, SGV_PASS); }
+extern "C" __global__ void __launch_bounds__(256) sg_gate_v_bf16(const bf16_t* x, bf16_t* out, DWT_ARGS, int C, int H, int W, SGV_ARGS) { dw_tokens_v<bf16_t>(x, DWT_PASS, out, C, H, W, SGV_PASS); }
 
 // Statistics of a transposed ("channel") attention over the tokens, from a
 // (B, N, 3C) qkv buffer with heads of d <= 32 channels: per head the Gram
@@ -1467,6 +1511,7 @@ _PROGRAMS: dict[str, tuple[str, list[str], list[str]]] = {
         [f"sg_{k}_{s}" for k in ("stats", "gate") for s in _DTYPE_SUFFIX.values()]
         + [f"dw_tokens_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"dw_tokens_v_{s}" for s in _DTYPE_SUFFIX.values()]
+        + [f"sg_gate_v_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"chan_gram_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"add_ln_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"aim_ln_{s}" for s in _DTYPE_SUFFIX.values()]
@@ -2012,9 +2057,12 @@ def spatial_gate(
     eps: float,
     weight: torch.Tensor,
     bias: torch.Tensor | None,
+    gelu_in: bool = False,
 ) -> torch.Tensor:
     """
     DAT's SpatialGate: x1 * dwconv3x3(LayerNorm(x2)), in the (B, H*W, 2C) layout.
+    With gelu_in, of GELU(x) (the FFN's activation before it), without storing
+    GELU(x).
 
     gamma/beta: (C,) float32. weight: (C, 9) float32. bias: (C,) float32 or None.
     Returns (B, H*W, C).
@@ -2025,6 +2073,10 @@ def spatial_gate(
     device = x.device.index or 0
     sfx = _DTYPE_SUFFIX[x.dtype]
     stream = _stream(x)
+    vec = _dwv and C % 4 == 0 and x.data_ptr() % 16 == 0
+    if gelu_in and not vec:
+        x = torch.nn.functional.gelu(x)
+        gelu_in = False
     tokens = B * L
     stats = torch.empty((tokens, 2), device=x.device, dtype=torch.float32)
     hip.launch(
@@ -2037,10 +2089,36 @@ def spatial_gate(
             ctypes.c_int64(tokens),
             ctypes.c_float(eps),
             ctypes.c_void_p(stats.data_ptr()),
+            ctypes.c_int(1 if gelu_in else 0),
         ],
         stream,
     )
     out = torch.empty((B, L, C), device=x.device, dtype=x.dtype)
+    if vec:
+        chunks = (C // 4 + _DWV_CV - 1) // _DWV_CV
+        hip.launch(
+            hip.get(device, "spatial_gate", f"sg_gate_v_{sfx}"),
+            (-(-W // _DWV_TX), -(-H // _DWV_TY), B * chunks),
+            (256, 1, 1),
+            [
+                ctypes.c_void_p(x.data_ptr()),
+                ctypes.c_void_p(out.data_ptr()),
+                ctypes.c_int64(C2),
+                ctypes.c_int(C),
+                ctypes.c_void_p(weight.data_ptr()),
+                ctypes.c_void_p(bias.data_ptr() if bias is not None else 0),
+                ctypes.c_int(2 if gelu_in else 0),
+                ctypes.c_int(C),
+                ctypes.c_int(H),
+                ctypes.c_int(W),
+                ctypes.c_void_p(stats.data_ptr()),
+                ctypes.c_void_p(gamma.data_ptr()),
+                ctypes.c_void_p(beta.data_ptr()),
+                ctypes.c_int(0),
+            ],
+            stream,
+        )
+        return out
     chunks = (C + _SG_CC - 1) // _SG_CC
     hip.launch(
         hip.get(device, "spatial_gate", f"sg_gate_{sfx}"),

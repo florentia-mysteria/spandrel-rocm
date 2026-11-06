@@ -28,6 +28,8 @@ logger = logging.getLogger("spandrel.rocm")
 # always have the same size.
 # for comparisons: SPANDREL_DAT_CHAN_ATTN=0 runs the original channel attention
 _chan_attn = os.environ.get("SPANDREL_DAT_CHAN_ATTN", "").strip() != "0"
+# also for comparisons: False runs the FFN (SGFN) unfused
+_fused_ffn = True
 
 _mask_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 _mask_lock = threading.Lock()
@@ -647,6 +649,28 @@ def _block_usable(module: nn.Module, x: torch.Tensor) -> bool:
     )
 
 
+def _sgfn_fusable(ffn: nn.Module) -> bool:
+    ok = ffn.__dict__.get("_spandrel_fusable")
+    if ok is None:
+        try:
+            sg = ffn.sg
+            ok = (
+                isinstance(ffn.act, nn.GELU)
+                and ffn.act.approximate == "none"
+                and isinstance(ffn.fc1, nn.Linear)
+                and isinstance(ffn.fc2, nn.Linear)
+                and isinstance(sg.norm, nn.LayerNorm)
+                and sg.norm.weight is not None
+                and sg.norm.bias is not None
+                and is_depthwise_3x3(sg.conv)
+                and not _spatial_gate_failed
+            )
+        except AttributeError:
+            ok = False
+        ffn.__dict__["_spandrel_fusable"] = ok
+    return ok
+
+
 def dat_block(module: nn.Module, x, x_size):
     """
     DATB: x + attn(norm1(x)), then + ffn(norm2(.)). PyTorch's LayerNorm on ROCm
@@ -665,6 +689,17 @@ def dat_block(module: nn.Module, x, x_size):
         _, n1 = kernels.layer_norm(x, g1, b1, module.norm1.eps)
         a = module.drop_path(module.attn(n1, H, W))
         s, n2 = kernels.layer_norm(x, g2, b2, module.norm2.eps, residual=a)
+        ffn = module.ffn
+        if _fused_ffn and _sgfn_fusable(ffn):
+            h = ffn.fc1(n2)
+            if kernels.can_spatial_gate(h, H, W):
+                # SGFN with its GELU applied while the spatial gate loads
+                gamma, beta, weight, bias = _sg_params(ffn.sg)
+                g = kernels.spatial_gate(
+                    h, H, W, gamma, beta, ffn.sg.norm.eps, weight, bias, gelu_in=True
+                )
+                return s + ffn.fc2(g)
+            return s + ffn.fc2(ffn.sg(ffn.act(h), H, W))
         return s + module.drop_path(module.ffn(n2, H, W))
     except Exception as e:  # noqa: BLE001
         _ln_failed = True
