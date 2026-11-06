@@ -423,6 +423,149 @@ extern "C" __global__ void dw_tokens_f32(const float* x, float* out, DWT_ARGS, i
 extern "C" __global__ void dw_tokens_f16(const _Float16* x, _Float16* out, DWT_ARGS, int C, int H, int W) { dw_tokens<_Float16>(x, DWT_PASS, out, C, H, W); }
 extern "C" __global__ void dw_tokens_bf16(const bf16_t* x, bf16_t* out, DWT_ARGS, int C, int H, int W) { dw_tokens<bf16_t>(x, DWT_PASS, out, C, H, W); }
 
+// Same as dw_tokens for C, row_stride and ch_offset divisible by 4: every
+// thread owns 4 channels of one column and walks down DWV_TY rows, keeping the
+// partial sums of the next two output rows in registers. Each input row is
+// read (and GELU'd) once: the left/right neighbours come from a double-buffered
+// row in shared memory. A wave reads DWV_CV * 4 consecutive channels of a
+// pixel at once.
+#define DWV_CV 16
+#define DWV_TX 16
+#define DWV_TY 8
+__device__ __forceinline__ void load4(const float* p, long i, float v[4]) {
+    const float4 q = *(const float4*)(p + i);
+    v[0] = q.x; v[1] = q.y; v[2] = q.z; v[3] = q.w;
+}
+__device__ __forceinline__ void load4(const _Float16* p, long i, float v[4]) {
+    typedef _Float16 h4 __attribute__((ext_vector_type(4)));
+    const h4 q = *(const h4*)(p + i);
+    v[0] = (float)q.x; v[1] = (float)q.y; v[2] = (float)q.z; v[3] = (float)q.w;
+}
+__device__ __forceinline__ void load4(const bf16_t* p, long i, float v[4]) {
+    const uint2 q = *(const uint2*)(p + i);
+    v[0] = __uint_as_float(q.x << 16); v[1] = __uint_as_float(q.x & 0xFFFF0000u);
+    v[2] = __uint_as_float(q.y << 16); v[3] = __uint_as_float(q.y & 0xFFFF0000u);
+}
+__device__ __forceinline__ void store4(float* p, long i, const float v[4]) {
+    *(float4*)(p + i) = make_float4(v[0], v[1], v[2], v[3]);
+}
+__device__ __forceinline__ void store4(_Float16* p, long i, const float v[4]) {
+    typedef _Float16 h4 __attribute__((ext_vector_type(4)));
+    h4 q; q.x = (_Float16)v[0]; q.y = (_Float16)v[1]; q.z = (_Float16)v[2]; q.w = (_Float16)v[3];
+    *(h4*)(p + i) = q;
+}
+__device__ __forceinline__ unsigned int bf16_bits(float v) {
+    unsigned int u = __float_as_uint(v);
+    return (u + 0x7FFFu + ((u >> 16) & 1u)) >> 16;
+}
+__device__ __forceinline__ void store4(bf16_t* p, long i, const float v[4]) {
+    *(uint2*)(p + i) = make_uint2(bf16_bits(v[0]) | (bf16_bits(v[1]) << 16),
+                                  bf16_bits(v[2]) | (bf16_bits(v[3]) << 16));
+}
+
+template <typename T>
+__device__ __forceinline__ void dwv_load(const T* __restrict__ x, long row_stride, long base,
+                                         int gy, int gx, int H, int W, float v[4]) {
+    if (gy < 0 || gy >= H || gx < 0 || gx >= W) {
+        v[0] = v[1] = v[2] = v[3] = 0.0f;
+        return;
+    }
+    load4(x, ((long)gy * W + gx) * row_stride + base, v);
+}
+
+// GELU on the conv input, rounded to T like a separate PyTorch GELU
+template <typename T>
+__device__ __forceinline__ float4 dwv_in(const float v[4], int gelu_in) {
+    if (!gelu_in) return make_float4(v[0], v[1], v[2], v[3]);
+    float g[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        T r;
+        store_val(&r, 0, 0.5f * v[j] * (1.0f + erff(v[j] * 0.70710678118654752f)));
+        g[j] = load_val(&r, 0);
+    }
+    return make_float4(g[0], g[1], g[2], g[3]);
+}
+
+template <typename T>
+__device__ void dw_tokens_v(const T* __restrict__ x, long row_stride, int ch_offset,
+                            const float* __restrict__ w, const float* __restrict__ bias,
+                            int gelu, T* __restrict__ out, int C, int H, int W) {
+    __shared__ float4 row[2][DWV_TX + 2][DWV_CV];
+    const int vecs = C / 4;
+    const int chunks = (vecs + DWV_CV - 1) / DWV_CV;
+    const int b = blockIdx.z / chunks;
+    const int lv = threadIdx.x % DWV_CV, tx = threadIdx.x / DWV_CV;
+    const int cv = (blockIdx.z % chunks) * DWV_CV + lv;
+    const int x0 = blockIdx.x * DWV_TX;
+    const int ox = x0 + tx;
+    const int y0 = blockIdx.y * DWV_TY;
+    // no early return: every thread takes part in the barriers
+    const bool active = cv < vecs && ox < W;
+    const int c = min(cv, vecs - 1) * 4;
+    const long L = (long)H * W;
+    const T* xb = x + (long)b * L * row_stride;
+    T* ob = out + (long)b * L * C;
+    const long base = ch_offset + c;
+    const int gin = gelu & 2;
+    // the first and last column of the block also load the halo column
+    const int hx = tx == 0 ? x0 - 1 : (tx == DWV_TX - 1 ? x0 + DWV_TX : -2);
+
+    float k[4][9], bc[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int i = 0; i < 9; i++) k[j][i] = w[(c + j) * 9 + i];
+        bc[j] = bias ? bias[c + j] : 0.0f;
+    }
+
+    // p0: output row y - 1 (has rows y - 2, y - 1), p1: output row y (has y - 1)
+    float p0[4], p1[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++) p0[j] = p1[j] = bc[j];
+    const int y_end = min(y0 + DWV_TY, H);
+    const int mx = cv < vecs ? ox : -1;
+    const int hxx = cv < vecs ? hx : -1;
+    // the next row is loaded one iteration ahead
+    float m[4], h[4];
+    dwv_load(xb, row_stride, base, y0 - 1, mx, H, W, m);
+    if (hx != -2) dwv_load(xb, row_stride, base, y0 - 1, hxx, H, W, h);
+    for (int y = y0 - 1; y <= y_end; y++) {
+        float4 (*buf)[DWV_CV] = row[y & 1];
+        buf[tx + 1][lv] = dwv_in<T>(m, gin);
+        if (hx != -2) buf[tx == 0 ? 0 : DWV_TX + 1][lv] = dwv_in<T>(h, gin);
+        if (y < y_end) {
+            dwv_load(xb, row_stride, base, y + 1, mx, H, W, m);
+            if (hx != -2) dwv_load(xb, row_stride, base, y + 1, hxx, H, W, h);
+        }
+        __syncthreads();
+        const float4 lq = buf[tx][lv], cq = buf[tx + 1][lv], rq = buf[tx + 2][lv];
+        const float l[4] = {lq.x, lq.y, lq.z, lq.w}, ce[4] = {cq.x, cq.y, cq.z, cq.w},
+                    r[4] = {rq.x, rq.y, rq.z, rq.w};
+        float o[4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const float h0 = k[j][0] * l[j] + k[j][1] * ce[j] + k[j][2] * r[j];
+            const float h1 = k[j][3] * l[j] + k[j][4] * ce[j] + k[j][5] * r[j];
+            const float h2 = k[j][6] * l[j] + k[j][7] * ce[j] + k[j][8] * r[j];
+            o[j] = p0[j] + h2;
+            p0[j] = p1[j] + h1;
+            p1[j] = bc[j] + h0;
+        }
+        if (active && y - 1 >= y0) {
+            if (gelu & 1) {
+                #pragma unroll
+                for (int j = 0; j < 4; j++) o[j] = 0.5f * o[j] * (1.0f + erff(o[j] * 0.70710678118654752f));
+            }
+            store4(ob, ((long)(y - 1) * W + ox) * C + c, o);
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) dw_tokens_v_f32(const float* x, float* out, DWT_ARGS, int C, int H, int W) { dw_tokens_v<float>(x, DWT_PASS, out, C, H, W); }
+extern "C" __global__ void __launch_bounds__(256) dw_tokens_v_f16(const _Float16* x, _Float16* out, DWT_ARGS, int C, int H, int W) { dw_tokens_v<_Float16>(x, DWT_PASS, out, C, H, W); }
+extern "C" __global__ void __launch_bounds__(256) dw_tokens_v_bf16(const bf16_t* x, bf16_t* out, DWT_ARGS, int C, int H, int W) { dw_tokens_v<bf16_t>(x, DWT_PASS, out, C, H, W); }
+
 // LayerNorm over the channels of contiguous (tokens, C) rows, optionally after
 // a residual add: sum = x + a (stored, rounded to T like PyTorch's add), out =
 // LayerNorm(sum). One wave32 per token, 8 tokens per 256-thread block, up to
@@ -1179,6 +1322,7 @@ _PROGRAMS: dict[str, tuple[str, list[str], list[str]]] = {
         _SG_SRC,
         [f"sg_{k}_{s}" for k in ("stats", "gate") for s in _DTYPE_SUFFIX.values()]
         + [f"dw_tokens_{s}" for s in _DTYPE_SUFFIX.values()]
+        + [f"dw_tokens_v_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"add_ln_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"gate_mix_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"hab_ln_{s}" for s in _DTYPE_SUFFIX.values()]
@@ -1697,6 +1841,8 @@ def window_attention(
 # --- DAT spatial gate ----------------------------------------------------------
 
 _SG_CC, _SG_SX, _SG_SY = 32, 8, 8
+_DWV_CV, _DWV_TX, _DWV_TY = 16, 16, 8
+_dwv = os.environ.get("SPANDREL_DW_VEC", "").strip() != "0"
 
 
 def can_spatial_gate(x: torch.Tensor, H: int, W: int) -> bool:  # noqa: N803
@@ -1795,12 +1941,24 @@ def dwconv_tokens(
         raise ValueError("token tensor rows must be contiguous")
     hip = _get_hip()
     out = torch.empty((B, L, channels), device=x.device, dtype=x.dtype)
-    chunks = (channels + _SG_CC - 1) // _SG_CC
+    suffix = _DTYPE_SUFFIX[x.dtype]
+    if (
+        _dwv
+        and channels % 4 == 0
+        and x.stride(1) % 4 == 0
+        and ch_offset % 4 == 0
+        and x.data_ptr() % 16 == 0
+    ):
+        chunks = (channels // 4 + _DWV_CV - 1) // _DWV_CV
+        name = f"dw_tokens_v_{suffix}"
+        grid = (-(-W // _DWV_TX), -(-H // _DWV_TY), B * chunks)
+    else:
+        chunks = (channels + _SG_CC - 1) // _SG_CC
+        name = f"dw_tokens_{suffix}"
+        grid = ((W + _SG_SX - 1) // _SG_SX, (H + _SG_SY - 1) // _SG_SY, B * chunks)
     hip.launch(
-        hip.get(
-            x.device.index or 0, "spatial_gate", f"dw_tokens_{_DTYPE_SUFFIX[x.dtype]}"
-        ),
-        ((W + _SG_SX - 1) // _SG_SX, (H + _SG_SY - 1) // _SG_SY, B * chunks),
+        hip.get(x.device.index or 0, "spatial_gate", name),
+        grid,
         (256, 1, 1),
         [
             ctypes.c_void_p(x.data_ptr()),
