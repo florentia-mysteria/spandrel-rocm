@@ -19,6 +19,7 @@ Returns None when it cannot be used, and fdat.py runs its original code.
 from __future__ import annotations
 
 import logging
+import os
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -30,6 +31,12 @@ from spandrel.__helpers.rocm.common import is_depthwise_3x3, version_of
 logger = logging.getLogger("spandrel.rocm")
 
 _failed = False
+# for comparisons: SPANDREL_FDAT_CHAN_ATTN=0 runs the original channel attention
+_chan_attn = os.environ.get("SPANDREL_FDAT_CHAN_ATTN", "").strip() != "0"
+# also for comparisons: False restores the separate residual add after fc2 and
+# the separate interaction before the second LayerNorm
+_fused_res = True
+_fused_aim = True
 
 
 def _cached(module: nn.Module, name: str, tensors: list[torch.Tensor], build):  # noqa: ANN001
@@ -129,6 +136,31 @@ def _window_attention(attn: nn.Module, x: torch.Tensor, H: int, W: int):  # noqa
     return attn.proj(out.view(B, L, C))
 
 
+def _channel_attention(attn: nn.Module, x: torch.Tensor):
+    """FastChannelAttention, or None if the kernel cannot be used."""
+    B, N, C = x.shape  # noqa: N806
+    nh = attn.nh
+    qkv = attn.qkv(x)
+    if not kernels.can_channel_gram(qkv, nh):
+        return None
+    d = C // nh
+    # softmax(normalize(q)^T normalize(k) * temp) from q^T k and the norms
+    # (F.normalize divides by max(norm, 1e-12)), in float32
+    gram, nq, nk = kernels.channel_gram(qkv, nh)
+    nq = nq.clamp_min(1e-12).view(B, nh, d, 1)
+    nk = nk.clamp_min(1e-12).view(B, nh, 1, d)
+    a = (gram / (nq * nk) * attn.temp.float()).softmax(-1)
+    # proj(attn @ v) = v @ (W_proj @ blockdiag(attn))^T + b_proj
+    wp = attn.proj.weight.float().view(C, nh, d).transpose(0, 1)
+    m = (wp @ a).permute(0, 2, 1, 3).reshape(B, C, C).to(x.dtype)
+    v = qkv[:, :, 2 * C :]
+    bias = attn.proj.bias
+    if B == 1:
+        return F.linear(v[0], m[0], bias).unsqueeze(0)
+    out = v @ m.transpose(1, 2)
+    return out if bias is None else out + bias
+
+
 def _interaction(
     inter: nn.Module, a: torch.Tensor, c: torch.Tensor, spatial_gate: bool
 ):
@@ -143,6 +175,26 @@ def _interaction(
     w2 = inter.cg[3].weight.flatten(1).to(c.dtype)
     gate = torch.sigmoid(F.linear(F.gelu(F.linear(pooled, w1)), w2))
     return torch.addcmul(c, a, gate)
+
+
+def _aim_gate(
+    inter: nn.Module, c: torch.Tensor, spatial_gate: bool
+) -> dict[str, torch.Tensor]:
+    """The gate argument of kernels.gated_mix_layer_norm for SimplifiedAIM."""
+    if spatial_gate:
+        # the conv weight rounded like F.linear in the model's dtype sees it
+        w = _cached(
+            inter.sg[0],
+            "_spandrel_sw",
+            [inter.sg[0].weight],
+            lambda: inter.sg[0].weight.detach().to(c.dtype).float().flatten(),
+        )
+        return {"spatial_weight": w}
+    pooled = torch.mean(c, dim=1, keepdim=True, dtype=torch.float32).to(c.dtype)
+    w1 = inter.cg[1].weight.flatten(1).to(c.dtype)
+    w2 = inter.cg[3].weight.flatten(1).to(c.dtype)
+    gate = torch.sigmoid(F.linear(F.gelu(F.linear(pooled, w1)), w2))
+    return {"channel_gate": gate.float().view(c.shape[0], -1)}
 
 
 def fdat_block(module: nn.Module, x: torch.Tensor, H: int, W: int):  # noqa: N803
@@ -169,6 +221,8 @@ def fdat_block(module: nn.Module, x: torch.Tensor, H: int, W: int):  # noqa: N80
         a = None
         if module.btype == "spatial":
             a = _window_attention(module.attn, n1, H, W)
+        elif _chan_attn:
+            a = _channel_attention(module.attn, n1)
         if a is None:
             a = module.attn(n1, H, W)
 
@@ -177,12 +231,22 @@ def fdat_block(module: nn.Module, x: torch.Tensor, H: int, W: int):  # noqa: N80
         )
         # spatial blocks use "channel_modulates_spatial" (channel gate) and
         # channel blocks "spatial_modulates_channel" (spatial gate)
-        fused = _interaction(
-            module.inter, a, conv, spatial_gate=module.btype != "spatial"
-        )
-
+        spatial_gate = module.btype != "spatial"
         g2, b2 = _ln_params(module.n2)
-        s, n2 = kernels.layer_norm(x, g2, b2, module.n2.eps, residual=fused)
+        if _fused_aim:
+            # the gated mix inside the second LayerNorm's residual add
+            s, n2 = kernels.gated_mix_layer_norm(
+                x,
+                a,
+                conv,
+                g2,
+                b2,
+                module.n2.eps,
+                **_aim_gate(module.inter, conv, spatial_gate),
+            )
+        else:
+            fused = _interaction(module.inter, a, conv, spatial_gate)
+            s, n2 = kernels.layer_norm(x, g2, b2, module.n2.eps, residual=fused)
 
         ffn = module.ffn
         h = ffn.fc1(n2)
@@ -197,6 +261,11 @@ def fdat_block(module: nn.Module, x: torch.Tensor, H: int, W: int):  # noqa: N80
             gelu=False,
             gelu_in=True,
         )
+        if ffn.fc2.bias is None and _fused_res:
+            # the residual add in the GEMM's epilogue (beta = 1)
+            return torch.addmm(
+                s.view(-1, c), h.view(-1, h.shape[-1]), ffn.fc2.weight.t()
+            ).view(s.shape)
         return s + ffn.fc2(h)
     except Exception as e:  # noqa: BLE001
         _failed = True

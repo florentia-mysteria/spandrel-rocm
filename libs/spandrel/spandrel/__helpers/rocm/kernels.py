@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import logging
+import math
 import os
 import sys
 import threading
@@ -566,6 +567,72 @@ extern "C" __global__ void __launch_bounds__(256) dw_tokens_v_f32(const float* x
 extern "C" __global__ void __launch_bounds__(256) dw_tokens_v_f16(const _Float16* x, _Float16* out, DWT_ARGS, int C, int H, int W) { dw_tokens_v<_Float16>(x, DWT_PASS, out, C, H, W); }
 extern "C" __global__ void __launch_bounds__(256) dw_tokens_v_bf16(const bf16_t* x, bf16_t* out, DWT_ARGS, int C, int H, int W) { dw_tokens_v<bf16_t>(x, DWT_PASS, out, C, H, W); }
 
+// Statistics of a transposed ("channel") attention over the tokens, from a
+// (B, N, 3C) qkv buffer with heads of d <= 32 channels: per head the Gram
+// matrix q^T k (d x d) and the squared norms of every q and k channel, all in
+// float32. One block per (token chunk, head, batch) writes the partial sums of
+// its chunk; they are summed afterwards, so the result does not depend on the
+// scheduling. Thread (i, 4 * j4 .. 4 * j4 + 3) accumulates gram[i][j].
+#define GR_TT 32
+template <typename T>
+__device__ void chan_gram(const T* __restrict__ qkv, int C, int nh, long N, long chunk_len,
+                          float* __restrict__ gram, float* __restrict__ sq) {
+    __shared__ float qs[GR_TT][33], ks[GR_TT][33];
+    const int d = C / nh;
+    const int chunk = blockIdx.x, h = blockIdx.y, b = blockIdx.z;
+    const int i = threadIdx.x >> 3, j0 = (threadIdx.x & 7) * 4;
+    const long n_begin = chunk * chunk_len;
+    const long n_end = min(N, n_begin + chunk_len);
+    const T* base = qkv + (long)b * N * 3 * C + h * d;
+
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f}, sq_q = 0.0f, sq_k[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (long n0 = n_begin; n0 < n_end; n0 += GR_TT) {
+        for (int e = threadIdx.x; e < GR_TT * 32; e += 256) {
+            const int t = e >> 5, ch = e & 31;
+            float q = 0.0f, k = 0.0f;
+            if (ch < d && n0 + t < n_end) {
+                const long r = (n0 + t) * 3 * C + ch;
+                q = load_val(base, r);
+                k = load_val(base, r + C);
+            }
+            qs[t][ch] = q;
+            ks[t][ch] = k;
+        }
+        __syncthreads();
+        #pragma unroll 8
+        for (int t = 0; t < GR_TT; t++) {
+            const float q = qs[t][i];
+            #pragma unroll
+            for (int jj = 0; jj < 4; jj++) acc[jj] += q * ks[t][j0 + jj];
+            if (j0 == 0) sq_q += q * q;
+            if (i == 0) {
+                #pragma unroll
+                for (int jj = 0; jj < 4; jj++) sq_k[jj] += ks[t][j0 + jj] * ks[t][j0 + jj];
+            }
+        }
+        __syncthreads();
+    }
+
+    const long part = (long)chunk * gridDim.z + b;
+    float* g = gram + (part * nh + h) * d * d;
+    #pragma unroll
+    for (int jj = 0; jj < 4; jj++)
+        if (i < d && j0 + jj < d) g[i * d + j0 + jj] = acc[jj];
+    float* s = sq + part * 2 * C + h * d;
+    if (j0 == 0 && i < d) s[i] = sq_q;
+    if (i == 0) {
+        #pragma unroll
+        for (int jj = 0; jj < 4; jj++)
+            if (j0 + jj < d) s[C + j0 + jj] = sq_k[jj];
+    }
+}
+
+#define GR_ARGS int C, int nh, long N, long chunk_len, float* gram, float* sq
+#define GR_PASS C, nh, N, chunk_len, gram, sq
+extern "C" __global__ void __launch_bounds__(256) chan_gram_f32(const float* qkv, GR_ARGS) { chan_gram<float>(qkv, GR_PASS); }
+extern "C" __global__ void __launch_bounds__(256) chan_gram_f16(const _Float16* qkv, GR_ARGS) { chan_gram<_Float16>(qkv, GR_PASS); }
+extern "C" __global__ void __launch_bounds__(256) chan_gram_bf16(const bf16_t* qkv, GR_ARGS) { chan_gram<bf16_t>(qkv, GR_PASS); }
+
 // LayerNorm over the channels of contiguous (tokens, C) rows, optionally after
 // a residual add: sum = x + a (stored, rounded to T like PyTorch's add), out =
 // LayerNorm(sum). One wave32 per token, 8 tokens per 256-thread block, up to
@@ -621,8 +688,85 @@ __device__ void add_ln(const T* __restrict__ x, const T* __restrict__ a, T* __re
     }
 }
 
+// add_ln after a gated mix of two branches a and c (the interaction of DAT-like
+// blocks, e.g. FDAT's SimplifiedAIM), so the mix is never stored:
+//   sw:    g = sigmoid(a . sw) per token,  mix = a + c * g   (spatial gate)
+//   cgate: g = cgate[b][ch],               mix = c + a * g   (channel gate)
+//   sum = x + mix, out = LayerNorm(sum)
+// The gate and the mix are rounded to T like PyTorch's linear, sigmoid and
+// addcmul. L: tokens per batch item.
+template <typename T>
+__device__ void aim_ln(const T* __restrict__ x, const T* __restrict__ a, const T* __restrict__ cb,
+                       const float* __restrict__ sw, const float* __restrict__ cgate,
+                       T* __restrict__ sum_out, T* __restrict__ out,
+                       const float* __restrict__ gamma, const float* __restrict__ beta,
+                       int C, long tokens, long L, float eps) {
+    const int lane = threadIdx.x & 31;
+    const long tok = (long)blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (tok >= tokens) return;
+    const long row = tok * C;
+    float av[8], cv[8];
+    float dot = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 8; k++) {
+        const int c = lane + 32 * k;
+        av[k] = cv[k] = 0.0f;
+        if (c < C) {
+            av[k] = load_val(a, row + c);
+            cv[k] = load_val(cb, row + c);
+            if (sw) dot += av[k] * sw[c];
+        }
+    }
+    float g = 0.0f;
+    if (sw) {
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor(dot, o, 32);
+        g = round_t(1.0f / (1.0f + expf(-round_t(dot, x))), x);
+    }
+    const float* cg = cgate ? cgate + (tok / L) * C : nullptr;
+    float v[8];
+    float s = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 8; k++) {
+        const int c = lane + 32 * k;
+        float t = 0.0f;
+        if (c < C) {
+            const float mix = sw ? round_t(av[k] + cv[k] * g, x)
+                                 : round_t(cv[k] + av[k] * cg[c], x);
+            t = round_t(load_val(x, row + c) + mix, x);
+        }
+        v[k] = t;
+        s += t;
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor(s, o, 32);
+    const float mean = s / C;
+    float q = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 8; k++) {
+        const int c = lane + 32 * k;
+        if (c < C) { const float dv = v[k] - mean; q += dv * dv; }
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) q += __shfl_xor(q, o, 32);
+    const float rstd = rsqrtf(q / C + eps);
+    #pragma unroll
+    for (int k = 0; k < 8; k++) {
+        const int c = lane + 32 * k;
+        if (c < C) {
+            store_val(sum_out, row + c, v[k]);
+            store_val(out, row + c, (v[k] - mean) * rstd * gamma[c] + beta[c]);
+        }
+    }
+}
+
 #define LN_ARGS const float* gamma, const float* beta, int C, long tokens, float eps
 #define LN_PASS gamma, beta, C, tokens, eps
+#define AIM_ARGS const float* sw, const float* cgate
+#define AIM_PASS sw, cgate
+extern "C" __global__ void aim_ln_f32(const float* x, const float* a, const float* c, AIM_ARGS, float* sum_out, float* out, LN_ARGS, long L) { aim_ln<float>(x, a, c, AIM_PASS, sum_out, out, gamma, beta, C, tokens, L, eps); }
+extern "C" __global__ void aim_ln_f16(const _Float16* x, const _Float16* a, const _Float16* c, AIM_ARGS, _Float16* sum_out, _Float16* out, LN_ARGS, long L) { aim_ln<_Float16>(x, a, c, AIM_PASS, sum_out, out, gamma, beta, C, tokens, L, eps); }
+extern "C" __global__ void aim_ln_bf16(const bf16_t* x, const bf16_t* a, const bf16_t* c, AIM_ARGS, bf16_t* sum_out, bf16_t* out, LN_ARGS, long L) { aim_ln<bf16_t>(x, a, c, AIM_PASS, sum_out, out, gamma, beta, C, tokens, L, eps); }
 extern "C" __global__ void add_ln_f32(const float* x, const float* a, float* sum_out, float* out, LN_ARGS) { add_ln<float>(x, a, sum_out, out, LN_PASS); }
 extern "C" __global__ void add_ln_f16(const _Float16* x, const _Float16* a, _Float16* sum_out, _Float16* out, LN_ARGS) { add_ln<_Float16>(x, a, sum_out, out, LN_PASS); }
 extern "C" __global__ void add_ln_bf16(const bf16_t* x, const bf16_t* a, bf16_t* sum_out, bf16_t* out, LN_ARGS) { add_ln<bf16_t>(x, a, sum_out, out, LN_PASS); }
@@ -1323,7 +1467,9 @@ _PROGRAMS: dict[str, tuple[str, list[str], list[str]]] = {
         [f"sg_{k}_{s}" for k in ("stats", "gate") for s in _DTYPE_SUFFIX.values()]
         + [f"dw_tokens_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"dw_tokens_v_{s}" for s in _DTYPE_SUFFIX.values()]
+        + [f"chan_gram_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"add_ln_{s}" for s in _DTYPE_SUFFIX.values()]
+        + [f"aim_ln_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"gate_mix_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"hab_ln_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"ln_nchw_{s}" for s in _DTYPE_SUFFIX.values()]
@@ -1977,6 +2123,59 @@ def dwconv_tokens(
     return out
 
 
+def can_channel_gram(qkv: torch.Tensor, heads: int) -> bool:
+    if qkv.dim() != 3 or not qkv.is_cuda or qkv.dtype not in _DTYPE_SUFFIX:
+        return False
+    C = qkv.shape[-1] // 3  # noqa: N806
+    return (
+        qkv.shape[-1] == 3 * C
+        and C % heads == 0
+        and 0 < C // heads <= 32
+        and qkv.is_contiguous()
+    )
+
+
+def channel_gram(
+    qkv: torch.Tensor, heads: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    For a (B, N, 3C) qkv tensor of a transposed attention with `heads` heads:
+    the per-head Gram matrices q^T k over the tokens, (B, heads, d, d), and the
+    L2 norms over the tokens of every q and k channel, (B, C) each. float32.
+    """
+    B, N, C3 = qkv.shape  # noqa: N806
+    C = C3 // 3  # noqa: N806
+    d = C // heads
+    # about 512 blocks, at least GR_TT tokens each
+    chunks = max(1, min(-(-512 // (heads * B)), -(-N // 32)))
+    chunk_len = math.ceil(math.ceil(N / chunks) / 32) * 32
+    chunks = -(-N // chunk_len)
+    gram = torch.empty((chunks, B, heads, d, d), device=qkv.device, dtype=torch.float32)
+    sq = torch.empty((chunks, B, 2, C), device=qkv.device, dtype=torch.float32)
+    hip = _get_hip()
+    hip.launch(
+        hip.get(
+            qkv.device.index or 0,
+            "spatial_gate",
+            f"chan_gram_{_DTYPE_SUFFIX[qkv.dtype]}",
+        ),
+        (chunks, heads, B),
+        (256, 1, 1),
+        [
+            ctypes.c_void_p(qkv.data_ptr()),
+            ctypes.c_int(C),
+            ctypes.c_int(heads),
+            ctypes.c_int64(N),
+            ctypes.c_int64(chunk_len),
+            ctypes.c_void_p(gram.data_ptr()),
+            ctypes.c_void_p(sq.data_ptr()),
+        ],
+        _stream(qkv),
+    )
+    norms = sq.sum(0).sqrt_()
+    return gram.sum(0), norms[:, 0], norms[:, 1]
+
+
 # --- LayerNorm (+ residual add) -----------------------------------------------
 
 
@@ -2025,6 +2224,58 @@ def layer_norm(
             ctypes.c_int(C),
             ctypes.c_int64(tokens),
             ctypes.c_float(eps),
+        ],
+        _stream(x),
+    )
+    return sum_out, out
+
+
+def gated_mix_layer_norm(
+    x: torch.Tensor,
+    a: torch.Tensor,
+    c: torch.Tensor,
+    gamma: torch.Tensor,
+    beta: torch.Tensor,
+    eps: float,
+    spatial_weight: torch.Tensor | None = None,
+    channel_gate: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    x + mix and LayerNorm(x + mix) of contiguous (B, L, C) tensors, where
+    mix = a + c * sigmoid(a @ spatial_weight)  (spatial_weight: (C,) float32)
+    or  mix = c + a * channel_gate             (channel_gate: (B, C) float32).
+    """
+    if (spatial_weight is None) == (channel_gate is None):
+        raise ValueError("pass exactly one of spatial_weight and channel_gate")
+    B, L, C = x.shape  # noqa: N806
+    tokens = B * L
+    a = a.contiguous()
+    c = c.contiguous()
+    out = torch.empty_like(x)
+    sum_out = torch.empty_like(x)
+    hip = _get_hip()
+    hip.launch(
+        hip.get(
+            x.device.index or 0, "spatial_gate", f"aim_ln_{_DTYPE_SUFFIX[x.dtype]}"
+        ),
+        ((tokens + 7) // 8, 1, 1),
+        (256, 1, 1),
+        [
+            ctypes.c_void_p(x.data_ptr()),
+            ctypes.c_void_p(a.data_ptr()),
+            ctypes.c_void_p(c.data_ptr()),
+            ctypes.c_void_p(
+                spatial_weight.data_ptr() if spatial_weight is not None else 0
+            ),
+            ctypes.c_void_p(channel_gate.data_ptr() if channel_gate is not None else 0),
+            ctypes.c_void_p(sum_out.data_ptr()),
+            ctypes.c_void_p(out.data_ptr()),
+            ctypes.c_void_p(gamma.data_ptr()),
+            ctypes.c_void_p(beta.data_ptr()),
+            ctypes.c_int(C),
+            ctypes.c_int64(tokens),
+            ctypes.c_float(eps),
+            ctypes.c_int64(L),
         ],
         _stream(x),
     )
