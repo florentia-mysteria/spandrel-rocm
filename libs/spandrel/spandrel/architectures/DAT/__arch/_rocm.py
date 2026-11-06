@@ -30,6 +30,15 @@ logger = logging.getLogger("spandrel.rocm")
 _chan_attn = os.environ.get("SPANDREL_DAT_CHAN_ATTN", "").strip() != "0"
 # also for comparisons: False runs the FFN (SGFN) unfused
 _fused_ffn = True
+# and False runs the linear layers with their own K instead of padded to 32
+_pad_k = True
+
+
+def _k_width(c: int) -> int | None:
+    """The row width for a tensor that feeds a linear layer (kernels.padded_linear)."""
+    w = kernels.padded_width(c)
+    return w if _pad_k and w != c else None
+
 
 _mask_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 _mask_lock = threading.Lock()
@@ -467,7 +476,7 @@ def adaptive_spatial_attention(module: nn.Module, x, H, W):  # noqa: N803
         return None
     try:
         B, L, C = x.shape
-        qkv_lin = module.qkv(x)  # B, L, 3C
+        qkv_lin = kernels.padded_linear(module.qkv, x)  # B, L, 3C
         qkv = qkv_lin.reshape(B, -1, 3, C).permute(2, 0, 1, 3)  # 3, B, L, C
 
         max_split_size = max(module.split_size[0], module.split_size[1])
@@ -532,9 +541,14 @@ def adaptive_spatial_attention(module: nn.Module, x, H, W):  # noqa: N803
         channel_map = _channel_map(module, conv_x)  # B, 1, C
         spatial_map = _spatial_map(attened_x, params)  # B, L, 1
         x = kernels.gate_mix(
-            attened_x, conv_x, spatial_map, channel_map, a_uses_tok=False
+            attened_x,
+            conv_x,
+            spatial_map,
+            channel_map,
+            a_uses_tok=False,
+            out_ld=_k_width(C),
         )
-        return module.proj_drop(module.proj(x))
+        return module.proj_drop(kernels.padded_linear(module.proj, x))
     except Exception as e:  # noqa: BLE001
         _aim_failed = True
         logger.warning("HIP adaptive interaction failed, falling back: %s", e)
@@ -579,7 +593,7 @@ def adaptive_channel_attention(module: nn.Module, x, H, W):  # noqa: N803
     try:
         B, N, C = x.shape
         heads = module.num_heads
-        qkv_lin = module.qkv(x)  # B, N, 3C
+        qkv_lin = kernels.padded_linear(module.qkv, x)  # B, N, 3C
         attened_x = _fused_channel_attention(module, qkv_lin)
         if attened_x is None:
             q = qkv_lin[..., :C].view(B, N, heads, C // heads).permute(0, 2, 3, 1)
@@ -603,9 +617,14 @@ def adaptive_channel_attention(module: nn.Module, x, H, W):  # noqa: N803
         channel_map = _channel_map(module, attened_x)  # B, 1, C
         spatial_map = _spatial_map(conv_x, params)  # B, N, 1
         x = kernels.gate_mix(
-            attened_x, conv_x, spatial_map, channel_map, a_uses_tok=True
+            attened_x,
+            conv_x,
+            spatial_map,
+            channel_map,
+            a_uses_tok=True,
+            out_ld=_k_width(C),
         )
-        return module.proj_drop(module.proj(x))
+        return module.proj_drop(kernels.padded_linear(module.proj, x))
     except Exception as e:  # noqa: BLE001
         _aim_failed = True
         logger.warning("HIP adaptive interaction failed, falling back: %s", e)
@@ -686,19 +705,37 @@ def dat_block(module: nn.Module, x, x_size):
     try:
         g1, b1 = _ln_params(module.norm1)
         g2, b2 = _ln_params(module.norm2)
-        _, n1 = kernels.layer_norm(x, g1, b1, module.norm1.eps)
+        c = x.shape[-1]
+        _, n1 = kernels.layer_norm(x, g1, b1, module.norm1.eps, out_ld=_k_width(c))
         a = module.drop_path(module.attn(n1, H, W))
-        s, n2 = kernels.layer_norm(x, g2, b2, module.norm2.eps, residual=a)
         ffn = module.ffn
-        if _fused_ffn and _sgfn_fusable(ffn):
-            h = ffn.fc1(n2)
+        fused = _fused_ffn and _sgfn_fusable(ffn)
+        s, n2 = kernels.layer_norm(
+            x,
+            g2,
+            b2,
+            module.norm2.eps,
+            residual=a,
+            out_ld=_k_width(c) if fused else None,
+        )
+        if fused:
+            h = kernels.padded_linear(ffn.fc1, n2)
             if kernels.can_spatial_gate(h, H, W):
                 # SGFN with its GELU applied while the spatial gate loads
                 gamma, beta, weight, bias = _sg_params(ffn.sg)
                 g = kernels.spatial_gate(
-                    h, H, W, gamma, beta, ffn.sg.norm.eps, weight, bias, gelu_in=True
+                    h,
+                    H,
+                    W,
+                    gamma,
+                    beta,
+                    ffn.sg.norm.eps,
+                    weight,
+                    bias,
+                    gelu_in=True,
+                    out_ld=_k_width(h.shape[-1] // 2),
                 )
-                return s + ffn.fc2(g)
+                return s + kernels.padded_linear(ffn.fc2, g)
             return s + ffn.fc2(ffn.sg(ffn.act(h), H, W))
         return s + module.drop_path(module.ffn(n2, H, W))
     except Exception as e:  # noqa: BLE001

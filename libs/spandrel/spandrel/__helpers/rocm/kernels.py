@@ -518,10 +518,13 @@ __device__ void dw_tokens_v(const T* __restrict__ x, long row_stride, int ch_off
                             int gelu, T* __restrict__ out, int C, int H, int W,
                             const float* __restrict__ stats = nullptr,
                             const float* __restrict__ gamma = nullptr,
-                            const float* __restrict__ beta = nullptr, int gate_off = -1) {
+                            const float* __restrict__ beta = nullptr, int gate_off = -1,
+                            int out_ld = 0) {
     __shared__ float4 row[2][DWV_TX + 2][DWV_CV];
     const int vecs = C / 4;
-    const int chunks = (vecs + DWV_CV - 1) / DWV_CV;
+    // out rows are ld wide, the columns past C zeroed
+    const int ld = out_ld > C ? out_ld : C;
+    const int chunks = (ld / 4 + DWV_CV - 1) / DWV_CV;
     const int b = blockIdx.z / chunks;
     const int lv = threadIdx.x % DWV_CV, tx = threadIdx.x / DWV_CV;
     const int cv = (blockIdx.z % chunks) * DWV_CV + lv;
@@ -533,8 +536,9 @@ __device__ void dw_tokens_v(const T* __restrict__ x, long row_stride, int ch_off
     const int c = min(cv, vecs - 1) * 4;
     const long L = (long)H * W;
     const T* xb = x + (long)b * L * row_stride;
-    T* ob = out + (long)b * L * C;
+    T* ob = out + (long)b * L * ld;
     const long base = ch_offset + c;
+    const bool pad = cv >= vecs && cv * 4 < ld && ox < W;
     const int gin = gelu & 2;
     // the first and last column of the block also load the halo column
     const int hx = tx == 0 ? x0 - 1 : (tx == DWV_TX - 1 ? x0 + DWV_TX : -2);
@@ -597,7 +601,10 @@ __device__ void dw_tokens_v(const T* __restrict__ x, long row_stride, int ch_off
                 const float4 gq = dwv_in<T>(g, gin);
                 o[0] *= gq.x; o[1] *= gq.y; o[2] *= gq.z; o[3] *= gq.w;
             }
-            store4(ob, ((long)(y - 1) * W + ox) * C + c, o);
+            store4(ob, ((long)(y - 1) * W + ox) * ld + c, o);
+        } else if (pad && y - 1 >= y0) {
+            const float z[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            store4(ob, ((long)(y - 1) * W + ox) * ld + cv * 4, z);
         }
     }
 }
@@ -605,8 +612,8 @@ __device__ void dw_tokens_v(const T* __restrict__ x, long row_stride, int ch_off
 extern "C" __global__ void __launch_bounds__(256) dw_tokens_v_f32(const float* x, float* out, DWT_ARGS, int C, int H, int W) { dw_tokens_v<float>(x, DWT_PASS, out, C, H, W); }
 extern "C" __global__ void __launch_bounds__(256) dw_tokens_v_f16(const _Float16* x, _Float16* out, DWT_ARGS, int C, int H, int W) { dw_tokens_v<_Float16>(x, DWT_PASS, out, C, H, W); }
 extern "C" __global__ void __launch_bounds__(256) dw_tokens_v_bf16(const bf16_t* x, bf16_t* out, DWT_ARGS, int C, int H, int W) { dw_tokens_v<bf16_t>(x, DWT_PASS, out, C, H, W); }
-#define SGV_ARGS const float* stats, const float* gamma, const float* beta, int gate_off
-#define SGV_PASS stats, gamma, beta, gate_off
+#define SGV_ARGS const float* stats, const float* gamma, const float* beta, int gate_off, int out_ld
+#define SGV_PASS stats, gamma, beta, gate_off, out_ld
 extern "C" __global__ void __launch_bounds__(256) sg_gate_v_f32(const float* x, float* out, DWT_ARGS, int C, int H, int W, SGV_ARGS) { dw_tokens_v<float>(x, DWT_PASS, out, C, H, W, SGV_PASS); }
 extern "C" __global__ void __launch_bounds__(256) sg_gate_v_f16(const _Float16* x, _Float16* out, DWT_ARGS, int C, int H, int W, SGV_ARGS) { dw_tokens_v<_Float16>(x, DWT_PASS, out, C, H, W, SGV_PASS); }
 extern "C" __global__ void __launch_bounds__(256) sg_gate_v_bf16(const bf16_t* x, bf16_t* out, DWT_ARGS, int C, int H, int W, SGV_ARGS) { dw_tokens_v<bf16_t>(x, DWT_PASS, out, C, H, W, SGV_PASS); }
@@ -692,7 +699,8 @@ __device__ __forceinline__ float round_t(float v, const bf16_t*) {
 template <typename T>
 __device__ void add_ln(const T* __restrict__ x, const T* __restrict__ a, T* __restrict__ sum_out,
                        T* __restrict__ out, const float* __restrict__ gamma,
-                       const float* __restrict__ beta, int C, long tokens, float eps) {
+                       const float* __restrict__ beta, int C, long tokens, float eps,
+                       int out_ld) {
     const int lane = threadIdx.x & 31;
     const long tok = (long)blockIdx.x * 8 + (threadIdx.x >> 5);
     if (tok >= tokens) return;
@@ -722,12 +730,17 @@ __device__ void add_ln(const T* __restrict__ x, const T* __restrict__ a, T* __re
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) q += __shfl_xor(q, o, 32);
     const float rstd = rsqrtf(q / C + eps);
+    // out rows are out_ld wide, the columns past C zeroed (input of a GEMM
+    // with K padded to out_ld)
+    const long orow = tok * out_ld;
     #pragma unroll
     for (int k = 0; k < 8; k++) {
         const int c = lane + 32 * k;
         if (c < C) {
             if (sum_out) store_val(sum_out, row + c, v[k]);
-            store_val(out, row + c, (v[k] - mean) * rstd * gamma[c] + beta[c]);
+            store_val(out, orow + c, (v[k] - mean) * rstd * gamma[c] + beta[c]);
+        } else if (c < out_ld) {
+            store_val(out, orow + c, 0.0f);
         }
     }
 }
@@ -811,9 +824,9 @@ __device__ void aim_ln(const T* __restrict__ x, const T* __restrict__ a, const T
 extern "C" __global__ void aim_ln_f32(const float* x, const float* a, const float* c, AIM_ARGS, float* sum_out, float* out, LN_ARGS, long L) { aim_ln<float>(x, a, c, AIM_PASS, sum_out, out, gamma, beta, C, tokens, L, eps); }
 extern "C" __global__ void aim_ln_f16(const _Float16* x, const _Float16* a, const _Float16* c, AIM_ARGS, _Float16* sum_out, _Float16* out, LN_ARGS, long L) { aim_ln<_Float16>(x, a, c, AIM_PASS, sum_out, out, gamma, beta, C, tokens, L, eps); }
 extern "C" __global__ void aim_ln_bf16(const bf16_t* x, const bf16_t* a, const bf16_t* c, AIM_ARGS, bf16_t* sum_out, bf16_t* out, LN_ARGS, long L) { aim_ln<bf16_t>(x, a, c, AIM_PASS, sum_out, out, gamma, beta, C, tokens, L, eps); }
-extern "C" __global__ void add_ln_f32(const float* x, const float* a, float* sum_out, float* out, LN_ARGS) { add_ln<float>(x, a, sum_out, out, LN_PASS); }
-extern "C" __global__ void add_ln_f16(const _Float16* x, const _Float16* a, _Float16* sum_out, _Float16* out, LN_ARGS) { add_ln<_Float16>(x, a, sum_out, out, LN_PASS); }
-extern "C" __global__ void add_ln_bf16(const bf16_t* x, const bf16_t* a, bf16_t* sum_out, bf16_t* out, LN_ARGS) { add_ln<bf16_t>(x, a, sum_out, out, LN_PASS); }
+extern "C" __global__ void add_ln_f32(const float* x, const float* a, float* sum_out, float* out, LN_ARGS, int out_ld) { add_ln<float>(x, a, sum_out, out, LN_PASS, out_ld); }
+extern "C" __global__ void add_ln_f16(const _Float16* x, const _Float16* a, _Float16* sum_out, _Float16* out, LN_ARGS, int out_ld) { add_ln<_Float16>(x, a, sum_out, out, LN_PASS, out_ld); }
+extern "C" __global__ void add_ln_bf16(const bf16_t* x, const bf16_t* a, bf16_t* sum_out, bf16_t* out, LN_ARGS, int out_ld) { add_ln<bf16_t>(x, a, sum_out, out, LN_PASS, out_ld); }
 
 // HAT's HAB residual and second LayerNorm in one pass:
 //   sum = (x + a) + (conv * ca[b, c]) * scale     (each op rounded to T, as in
@@ -974,6 +987,42 @@ __device__ void gate_mix(const T* __restrict__ a, const T* __restrict__ bt,
     }
 }
 
+// gate_mix for C % 4 == 0: 4 channels per thread with 8-byte loads.
+// out rows are out_ld wide, the columns past C zeroed.
+template <typename T>
+__device__ void gate_mix_v(const T* __restrict__ a, const T* __restrict__ bt,
+                           const T* __restrict__ tok, const T* __restrict__ ch,
+                           T* __restrict__ out, int C, long N, long total, int a_uses_tok,
+                           int out_ld) {
+    const int vecs = out_ld / 4;
+    for (long q = (long)blockIdx.x * 256 + threadIdx.x; q < total / C * vecs; q += (long)gridDim.x * 256) {
+        const long t = q / vecs;
+        const int c = (int)(q - t * vecs) * 4;
+        if (c >= C) {
+            const float z[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            store4(out, t * out_ld + c, z);
+            continue;
+        }
+        const long i = t * C + c;
+        const float ts = 1.0f / (1.0f + __expf(-load_val(tok, t)));
+        const T* chb = ch + (t / N) * C + c;
+        float va[4], vb[4], o[4];
+        load4(a, i, va);
+        load4(bt, i, vb);
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const float cs = 1.0f / (1.0f + __expf(-load_val(chb, j)));
+            o[j] = a_uses_tok ? va[j] * ts + vb[j] * cs : va[j] * cs + vb[j] * ts;
+        }
+        store4(out, t * out_ld + c, o);
+    }
+}
+
+#define GM_ARGS int C, long N, long total, int a_uses_tok, int out_ld
+#define GM_PASS C, N, total, a_uses_tok, out_ld
+extern "C" __global__ void gate_mix_v_f32(const float* a, const float* b, const float* tok, const float* ch, float* out, GM_ARGS) { gate_mix_v<float>(a, b, tok, ch, out, GM_PASS); }
+extern "C" __global__ void gate_mix_v_f16(const _Float16* a, const _Float16* b, const _Float16* tok, const _Float16* ch, _Float16* out, GM_ARGS) { gate_mix_v<_Float16>(a, b, tok, ch, out, GM_PASS); }
+extern "C" __global__ void gate_mix_v_bf16(const bf16_t* a, const bf16_t* b, const bf16_t* tok, const bf16_t* ch, bf16_t* out, GM_ARGS) { gate_mix_v<bf16_t>(a, b, tok, ch, out, GM_PASS); }
 extern "C" __global__ void gate_mix_f32(const float* a, const float* b, const float* tok, const float* ch, float* out, int C, long N, long total, int a_uses_tok) { gate_mix<float>(a, b, tok, ch, out, C, N, total, a_uses_tok); }
 extern "C" __global__ void gate_mix_f16(const _Float16* a, const _Float16* b, const _Float16* tok, const _Float16* ch, _Float16* out, int C, long N, long total, int a_uses_tok) { gate_mix<_Float16>(a, b, tok, ch, out, C, N, total, a_uses_tok); }
 extern "C" __global__ void gate_mix_bf16(const bf16_t* a, const bf16_t* b, const bf16_t* tok, const bf16_t* ch, bf16_t* out, int C, long N, long total, int a_uses_tok) { gate_mix<bf16_t>(a, b, tok, ch, out, C, N, total, a_uses_tok); }
@@ -1516,6 +1565,7 @@ _PROGRAMS: dict[str, tuple[str, list[str], list[str]]] = {
         + [f"add_ln_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"aim_ln_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"gate_mix_{s}" for s in _DTYPE_SUFFIX.values()]
+        + [f"gate_mix_v_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"hab_ln_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"ln_nchw_{s}" for s in _DTYPE_SUFFIX.values()]
         + ["hab_ln_bf16_c16", "ln_nchw_bf16_i16"],
@@ -2058,6 +2108,7 @@ def spatial_gate(
     weight: torch.Tensor,
     bias: torch.Tensor | None,
     gelu_in: bool = False,
+    out_ld: int | None = None,
 ) -> torch.Tensor:
     """
     DAT's SpatialGate: x1 * dwconv3x3(LayerNorm(x2)), in the (B, H*W, 2C) layout.
@@ -2065,7 +2116,9 @@ def spatial_gate(
     GELU(x).
 
     gamma/beta: (C,) float32. weight: (C, 9) float32. bias: (C,) float32 or None.
-    Returns (B, H*W, C).
+    Returns (B, H*W, C); with `out_ld` (> C, a multiple of 4), a [..., :C] view
+    of a buffer with out_ld wide rows whose other columns are zero (see
+    padded_linear).
     """
     B, L, C2 = x.shape  # noqa: N806
     C = C2 // 2  # noqa: N806
@@ -2093,16 +2146,17 @@ def spatial_gate(
         ],
         stream,
     )
-    out = torch.empty((B, L, C), device=x.device, dtype=x.dtype)
     if vec:
-        chunks = (C // 4 + _DWV_CV - 1) // _DWV_CV
+        ld = out_ld if out_ld is not None and out_ld > C and out_ld % 4 == 0 else C
+        full = torch.empty((B, L, ld), device=x.device, dtype=x.dtype)
+        chunks = (ld // 4 + _DWV_CV - 1) // _DWV_CV
         hip.launch(
             hip.get(device, "spatial_gate", f"sg_gate_v_{sfx}"),
             (-(-W // _DWV_TX), -(-H // _DWV_TY), B * chunks),
             (256, 1, 1),
             [
                 ctypes.c_void_p(x.data_ptr()),
-                ctypes.c_void_p(out.data_ptr()),
+                ctypes.c_void_p(full.data_ptr()),
                 ctypes.c_int64(C2),
                 ctypes.c_int(C),
                 ctypes.c_void_p(weight.data_ptr()),
@@ -2115,10 +2169,12 @@ def spatial_gate(
                 ctypes.c_void_p(gamma.data_ptr()),
                 ctypes.c_void_p(beta.data_ptr()),
                 ctypes.c_int(0),
+                ctypes.c_int(ld),
             ],
             stream,
         )
-        return out
+        return full if ld == C else full[..., :C]
+    out = torch.empty((B, L, C), device=x.device, dtype=x.dtype)
     chunks = (C + _SG_CC - 1) // _SG_CC
     hip.launch(
         hip.get(device, "spatial_gate", f"sg_gate_{sfx}"),
@@ -2273,15 +2329,21 @@ def layer_norm(
     beta: torch.Tensor,
     eps: float,
     residual: torch.Tensor | None = None,
+    out_ld: int | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
     """
     LayerNorm over the last dim of a contiguous tensor. With `residual`, first
     computes x + residual and returns (that sum, its LayerNorm); otherwise
     (None, LayerNorm(x)). gamma/beta: float32 contiguous.
+
+    With `out_ld` (> C, <= 256), the LayerNorm is a [..., :C] view of a buffer
+    with out_ld wide rows whose other columns are zero (see padded_linear).
     """
     C = x.shape[-1]  # noqa: N806
     tokens = x.numel() // C
-    out = torch.empty_like(x)
+    ld = out_ld if out_ld is not None and C < out_ld <= 256 else C
+    full = torch.empty((*x.shape[:-1], ld), device=x.device, dtype=x.dtype)
+    out = full if ld == C else full[..., :C]
     sum_out = torch.empty_like(x) if residual is not None else None
     if residual is not None:
         residual = residual.contiguous()
@@ -2296,16 +2358,48 @@ def layer_norm(
             ctypes.c_void_p(x.data_ptr()),
             ctypes.c_void_p(residual.data_ptr() if residual is not None else 0),
             ctypes.c_void_p(sum_out.data_ptr() if sum_out is not None else 0),
-            ctypes.c_void_p(out.data_ptr()),
+            ctypes.c_void_p(full.data_ptr()),
             ctypes.c_void_p(gamma.data_ptr()),
             ctypes.c_void_p(beta.data_ptr()),
             ctypes.c_int(C),
             ctypes.c_int64(tokens),
             ctypes.c_float(eps),
+            ctypes.c_int(ld),
         ],
         _stream(x),
     )
     return sum_out, out
+
+
+def padded_width(k: int) -> int:
+    """
+    The width to pad a GEMM's K to: a multiple of 32. hipBLASLt's kernels for
+    DAT's K = 180 are up to 1.7x slower than for K = 192 on gfx1201.
+    """
+    return -(-k // 32) * 32
+
+
+def padded_linear(lin: torch.nn.Linear, x: torch.Tensor) -> torch.Tensor:
+    """
+    lin(x) for x = buf[..., :K] of a buffer with wider rows whose extra columns
+    are zero (from layer_norm, gate_mix or spatial_gate with out_ld): the GEMM
+    runs with K = the row width and the weight zero padded to it (cached).
+    Same result as lin(x), for any x.
+    """
+    K = x.shape[-1]  # noqa: N806
+    ld = x.stride(-2) if x.dim() >= 2 else K
+    if ld == K or x.stride(-1) != 1:
+        return lin(x)
+    full = x.as_strided((*x.shape[:-1], ld), x.stride())
+    w = lin.weight
+    key = (w.data_ptr(), w._version, w.dtype, ld)  # noqa: SLF001
+    cached = lin.__dict__.get("_spandrel_padded_w")
+    if cached is None or cached[0] != key:
+        wp = torch.zeros((w.shape[0], ld), device=w.device, dtype=w.dtype)
+        wp[:, :K] = w.detach()
+        cached = (key, wp)
+        lin.__dict__["_spandrel_padded_w"] = cached
+    return torch.nn.functional.linear(full, cached[1], lin.bias)
 
 
 def gated_mix_layer_norm(
@@ -2468,36 +2562,45 @@ def gate_mix(
     tok: torch.Tensor,
     ch: torch.Tensor,
     a_uses_tok: bool,
+    out_ld: int | None = None,
 ) -> torch.Tensor:
     """
     a * sigmoid(tok) + b * sigmoid(ch) (or with tok/ch swapped between a and b)
     for (B, N, C) tensors a and b, a per-token map tok (B, N, 1) and a
-    per-channel map ch (B, 1, C), in one pass.
+    per-channel map ch (B, 1, C), in one pass. With `out_ld` (> C, a multiple
+    of 4), a [..., :C] view of a buffer with out_ld wide rows whose other
+    columns are zero (see padded_linear).
     """
     B, N, C = a.shape  # noqa: N806
     a, b = a.contiguous(), b.contiguous()
     tok = tok.reshape(B, N).to(a.dtype).contiguous()
     ch = ch.reshape(B, C).to(a.dtype).contiguous()
-    out = torch.empty_like(a)
     total = a.numel()
+    vec = _dwv and C % 4 == 0 and all(t.data_ptr() % 16 == 0 for t in (a, b))
+    ld = out_ld if vec and out_ld is not None and out_ld > C and out_ld % 4 == 0 else C
+    full = torch.empty((B, N, ld), device=a.device, dtype=a.dtype)
+    out = full if ld == C else full[..., :C]
+    name = f"gate_mix{'_v' if vec else ''}_{_DTYPE_SUFFIX[a.dtype]}"
+    threads = total // C * (ld // 4) if vec else total
+    args = [
+        ctypes.c_void_p(a.data_ptr()),
+        ctypes.c_void_p(b.data_ptr()),
+        ctypes.c_void_p(tok.data_ptr()),
+        ctypes.c_void_p(ch.data_ptr()),
+        ctypes.c_void_p(full.data_ptr()),
+        ctypes.c_int(C),
+        ctypes.c_int64(N),
+        ctypes.c_int64(total),
+        ctypes.c_int(1 if a_uses_tok else 0),
+    ]
+    if vec:
+        args.append(ctypes.c_int(ld))
     hip = _get_hip()
     hip.launch(
-        hip.get(
-            a.device.index or 0, "spatial_gate", f"gate_mix_{_DTYPE_SUFFIX[a.dtype]}"
-        ),
-        (min((total + 255) // 256, 65535), 1, 1),
+        hip.get(a.device.index or 0, "spatial_gate", name),
+        (min((threads + 255) // 256, 65535), 1, 1),
         (256, 1, 1),
-        [
-            ctypes.c_void_p(a.data_ptr()),
-            ctypes.c_void_p(b.data_ptr()),
-            ctypes.c_void_p(tok.data_ptr()),
-            ctypes.c_void_p(ch.data_ptr()),
-            ctypes.c_void_p(out.data_ptr()),
-            ctypes.c_int(C),
-            ctypes.c_int64(N),
-            ctypes.c_int64(total),
-            ctypes.c_int(1 if a_uses_tok else 0),
-        ],
+        args,
         _stream(a),
     )
     return out
