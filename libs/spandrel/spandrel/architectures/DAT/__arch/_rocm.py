@@ -663,6 +663,12 @@ def _block_usable(module: nn.Module, x: torch.Tensor) -> bool:
             and n.elementwise_affine
             and n.bias is not None
             and tuple(n.normalized_shape) == (c,)
+            # FP16 models keep the last group's trunk in FP32 (fp32_last_group):
+            # its LayerNorms read the FP32 sums and hand the branches FP16
+            and (
+                n.weight.dtype == x.dtype
+                or (n.weight.dtype == torch.float16 and x.dtype == torch.float32)
+            )
             for n in (module.norm1, module.norm2)
         )
     )
@@ -706,7 +712,11 @@ def dat_block(module: nn.Module, x, x_size):
         g1, b1 = _ln_params(module.norm1)
         g2, b2 = _ln_params(module.norm2)
         c = x.shape[-1]
-        _, n1 = kernels.layer_norm(x, g1, b1, module.norm1.eps, out_ld=_k_width(c))
+        # the branches' dtype: FP16 under an FP32 trunk (fp32_last_group), else x's
+        wd = module.norm1.weight.dtype
+        _, n1 = kernels.layer_norm(
+            x, g1, b1, module.norm1.eps, out_ld=_k_width(c), out_dtype=wd
+        )
         a = module.drop_path(module.attn(n1, H, W))
         ffn = module.ffn
         fused = _fused_ffn and _sgfn_fusable(ffn)
@@ -717,6 +727,7 @@ def dat_block(module: nn.Module, x, x_size):
             module.norm2.eps,
             residual=a,
             out_ld=_k_width(c) if fused else None,
+            out_dtype=wd,
         )
         if fused:
             h = kernels.padded_linear(ffn.fc1, n2)

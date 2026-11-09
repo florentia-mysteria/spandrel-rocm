@@ -184,7 +184,9 @@ def hab_forward(module: nn.Module, x, x_size, rpi_sa):  # noqa: ANN001
     if _failed or module.training or not kernels.hip_kernels_available():
         return None
     x = x.contiguous()  # the first block of a group gets a transposed view
-    if not kernels.can_layer_norm(x):
+    # FP16 models keep the last group's trunk in FP32 (fp32_last_group): that
+    # group's blocks take the plain path, which promotes the sums
+    if not kernels.can_layer_norm(x) or module.norm1.weight.dtype != x.dtype:
         return None
     h, w = x_size
     b, n, c = x.shape
@@ -286,7 +288,12 @@ def ocab_forward(module: nn.Module, x, x_size, rpi):  # noqa: ANN001
     x = x.contiguous()
     h, w = x_size
     b, n, c = x.shape
-    if n != h * w or not kernels.can_layer_norm(x) or c > 256:
+    if (
+        n != h * w
+        or not kernels.can_layer_norm(x)
+        or c > 256
+        or module.norm1.weight.dtype != x.dtype  # FP32 trunk of an FP16 model
+    ):
         return None
     if not all(
         isinstance(norm, nn.LayerNorm)

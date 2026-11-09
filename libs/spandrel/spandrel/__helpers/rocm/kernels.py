@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import functools
 import hashlib
 import logging
 import math
@@ -21,14 +22,14 @@ logger = logging.getLogger("spandrel.rocm")
 _DWCONV_SRC = r"""
 typedef unsigned short bf16_t;
 
-__device__ __forceinline__ float load_val(const float* p, long i) { return p[i]; }
-__device__ __forceinline__ float load_val(const _Float16* p, long i) { return (float)p[i]; }
-__device__ __forceinline__ float load_val(const bf16_t* p, long i) {
+__device__ __forceinline__ float load_val(const float* p, long long i) { return p[i]; }
+__device__ __forceinline__ float load_val(const _Float16* p, long long i) { return (float)p[i]; }
+__device__ __forceinline__ float load_val(const bf16_t* p, long long i) {
     return __uint_as_float(((unsigned int)p[i]) << 16);
 }
-__device__ __forceinline__ void store_val(float* p, long i, float v) { p[i] = v; }
-__device__ __forceinline__ void store_val(_Float16* p, long i, float v) { p[i] = (_Float16)v; }
-__device__ __forceinline__ void store_val(bf16_t* p, long i, float v) {
+__device__ __forceinline__ void store_val(float* p, long long i, float v) { p[i] = v; }
+__device__ __forceinline__ void store_val(_Float16* p, long long i, float v) { p[i] = (_Float16)v; }
+__device__ __forceinline__ void store_val(bf16_t* p, long long i, float v) {
     unsigned int u = __float_as_uint(v);
     u += 0x7FFFu + ((u >> 16) & 1u);  // round to nearest even
     p[i] = (bf16_t)(u >> 16);
@@ -48,7 +49,7 @@ __device__ void dwconv3x3(const T* __restrict__ x, const float* __restrict__ w,
     __shared__ float tile[TH + 2][TW + 2];
     const int bc = blockIdx.z;  // batch * C + channel
     const int c = bc % C;
-    const long plane = (long)bc * H * W;
+    const long long plane = (long long)bc * H * W;
     const int x0 = blockIdx.x * TW, y0 = blockIdx.y * TH;
     const int tid = threadIdx.y * TW + threadIdx.x;
 
@@ -56,7 +57,7 @@ __device__ void dwconv3x3(const T* __restrict__ x, const float* __restrict__ w,
         int ty = i / (TW + 2), tx = i % (TW + 2);
         int gy = y0 + ty - 1, gx = x0 + tx - 1;
         tile[ty][tx] = (gy >= 0 && gy < H && gx >= 0 && gx < W)
-            ? load_val(x, plane + (long)gy * W + gx) : 0.0f;
+            ? load_val(x, plane + (long long)gy * W + gx) : 0.0f;
     }
     __syncthreads();
 
@@ -69,7 +70,7 @@ __device__ void dwconv3x3(const T* __restrict__ x, const float* __restrict__ w,
         #pragma unroll
         for (int j = 0; j < 3; j++)
             acc += tile[threadIdx.y + i][threadIdx.x + j] * k[i * 3 + j];
-    store_val(y, plane + (long)oy * W + ox, acc);
+    store_val(y, plane + (long long)oy * W + ox, acc);
 }
 
 extern "C" __global__ void dwconv3x3_f32(const float* x, const float* w, const float* b, float* y, int C, int H, int W) { dwconv3x3<float>(x, w, b, y, C, H, W); }
@@ -81,21 +82,21 @@ extern "C" __global__ void dwconv3x3_bf16(const bf16_t* x, const float* w, const
 _ATTN_SRC = r"""
 typedef unsigned short bf16_t;
 
-__device__ __forceinline__ float load_val(const float* p, long i) { return p[i]; }
-__device__ __forceinline__ float load_val(const _Float16* p, long i) { return (float)p[i]; }
-__device__ __forceinline__ float load_val(const bf16_t* p, long i) {
+__device__ __forceinline__ float load_val(const float* p, long long i) { return p[i]; }
+__device__ __forceinline__ float load_val(const _Float16* p, long long i) { return (float)p[i]; }
+__device__ __forceinline__ float load_val(const bf16_t* p, long long i) {
     return __uint_as_float(((unsigned int)p[i]) << 16);
 }
-__device__ __forceinline__ void store_val(float* p, long i, float v) { p[i] = v; }
-__device__ __forceinline__ void store_val(_Float16* p, long i, float v) { p[i] = (_Float16)v; }
-__device__ __forceinline__ void store_val(bf16_t* p, long i, float v) {
+__device__ __forceinline__ void store_val(float* p, long long i, float v) { p[i] = v; }
+__device__ __forceinline__ void store_val(_Float16* p, long long i, float v) { p[i] = (_Float16)v; }
+__device__ __forceinline__ void store_val(bf16_t* p, long long i, float v) {
     unsigned int u = __float_as_uint(v);
     u += 0x7FFFu + ((u >> 16) & 1u);
     p[i] = (bf16_t)(u >> 16);
 }
-__device__ __forceinline__ void copy_val(float* d, long di, const float* s, long si) { d[di] = s[si]; }
-__device__ __forceinline__ void copy_val(_Float16* d, long di, const _Float16* s, long si) { d[di] = s[si]; }
-__device__ __forceinline__ void copy_val(bf16_t* d, long di, const bf16_t* s, long si) { d[di] = s[si]; }
+__device__ __forceinline__ void copy_val(float* d, long long di, const float* s, long long si) { d[di] = s[si]; }
+__device__ __forceinline__ void copy_val(_Float16* d, long long di, const _Float16* s, long long si) { d[di] = s[si]; }
+__device__ __forceinline__ void copy_val(bf16_t* d, long long di, const bf16_t* s, long long si) { d[di] = s[si]; }
 
 #define CH 16
 
@@ -128,9 +129,9 @@ __device__ __forceinline__ void load8(const bf16_t* p, float* o) {
 // K and V rows are padded to DP (a multiple of the 8-byte vector width) and
 // zero filled, so the inner loops read shared memory 8 bytes at a time.
 template <typename T, int DMAX>
-__device__ void win_attn(const T* __restrict__ qkv, long s0, long s1, long s2, long s3,
+__device__ void win_attn(const T* __restrict__ qkv, long long s0, long long s1, long long s2, long long s3,
                          const float* __restrict__ biasT, const int* __restrict__ labels,
-                         T* __restrict__ out, long out_stride, int out_off, int Hc, int Wc,
+                         T* __restrict__ out, long long out_stride, int out_off, int Hc, int Wc,
                          int sy, int sx, int H, int W, int H_sp, int W_sp,
                          int heads, int d, float scale) {
     constexpr int VEC = 8 / sizeof(T);
@@ -155,7 +156,7 @@ __device__ void win_attn(const T* __restrict__ qkv, long s0, long s1, long s2, l
     // positions past the Hc x Wc image are the window padding: zero q/k/v,
     // exactly like DAT's F.pad, without materializing the padded copy
     const bool valid = ys < Hc && xs < Wc;
-    const long base = (long)b * s1 + ((long)ys * Wc + xs) * s2 + (long)(h * d) * s3;
+    const long long base = (long long)b * s1 + ((long long)ys * Wc + xs) * s2 + (long long)(h * d) * s3;
 
     float q[DMAX];
     #pragma unroll
@@ -173,7 +174,7 @@ __device__ void win_attn(const T* __restrict__ qkv, long s0, long s1, long s2, l
     __syncthreads();
 
     const int lab = labels ? labs[n] : 0;
-    const float* bcol = biasT ? biasT + (long)h * N * N + n : nullptr;
+    const float* bcol = biasT ? biasT + (long long)h * N * N + n : nullptr;
     float m = -__builtin_inff(), lsum = 0.0f, acc[DMAX];
     #pragma unroll
     for (int j = 0; j < DMAX; j++) acc[j] = 0.0f;
@@ -194,7 +195,7 @@ __device__ void win_attn(const T* __restrict__ qkv, long s0, long s1, long s2, l
                     for (int e = 0; e < VEC; e++) dot += q[j + e] * kv[e];
                 }
             }
-            if (bcol) dot += bcol[(long)(k0 + c) * N];
+            if (bcol) dot += bcol[(long long)(k0 + c) * N];
             if (labels && labs[k0 + c] != lab) dot -= 100.0f;
             s[c] = dot;
             cm = fmaxf(cm, dot);
@@ -225,13 +226,13 @@ __device__ void win_attn(const T* __restrict__ qkv, long s0, long s1, long s2, l
     // write into (B, Hc, Wc, out_stride) at channel out_off, cropping padding
     if (ys >= Hc || xs >= Wc) return;
     const float inv = 1.0f / lsum;
-    const long ob = (((long)b * Hc + ys) * Wc + xs) * out_stride + out_off + h * d;
+    const long long ob = (((long long)b * Hc + ys) * Wc + xs) * out_stride + out_off + h * d;
     #pragma unroll
     for (int j = 0; j < DMAX; j++)
         if (j < d) store_val(out, ob + j, acc[j] * inv);
 }
 
-#define ATTN_ARGS long s0, long s1, long s2, long s3, const float* biasT, const int* labels, long out_stride, int out_off, int Hc, int Wc, int sy, int sx, int H, int W, int H_sp, int W_sp, int heads, int d, float scale
+#define ATTN_ARGS long long s0, long long s1, long long s2, long long s3, const float* biasT, const int* labels, long long out_stride, int out_off, int Hc, int Wc, int sy, int sx, int H, int W, int H_sp, int W_sp, int heads, int d, float scale
 #define ATTN_PASS s0, s1, s2, s3, biasT, labels
 #define ATTN_TAIL out_stride, out_off, Hc, Wc, sy, sx, H, W, H_sp, W_sp, heads, d, scale
 extern "C" __global__ void win_attn_f32_32(const float* qkv, float* out, ATTN_ARGS) { win_attn<float, 32>(qkv, ATTN_PASS, out, ATTN_TAIL); }
@@ -245,14 +246,24 @@ extern "C" __global__ void win_attn_bf16_64(const bf16_t* qkv, bf16_t* out, ATTN
 _SG_SRC = r"""
 typedef unsigned short bf16_t;
 
-__device__ __forceinline__ float load_val(const float* p, long i) { return p[i]; }
-__device__ __forceinline__ float load_val(const _Float16* p, long i) { return (float)p[i]; }
-__device__ __forceinline__ float load_val(const bf16_t* p, long i) {
+// GELU's erf: Abramowitz & Stegun 7.1.26, |error| <= 1.5e-7, far below FP16 and
+// BF16 rounding (GELU = 0.5x(1 + erf)); ~10% faster spatial gate than erff
+__device__ __forceinline__ float fast_erff(float x) {
+    const float ax = fabsf(x);
+    const float t = __frcp_rn(1.0f + 0.3275911f * ax);
+    const float p = ((((1.061405429f * t - 1.453152027f) * t + 1.421413741f) * t
+                     - 0.284496736f) * t + 0.254829592f) * t;
+    return copysignf(1.0f - p * __expf(-ax * ax), x);
+}
+
+__device__ __forceinline__ float load_val(const float* p, long long i) { return p[i]; }
+__device__ __forceinline__ float load_val(const _Float16* p, long long i) { return (float)p[i]; }
+__device__ __forceinline__ float load_val(const bf16_t* p, long long i) {
     return __uint_as_float(((unsigned int)p[i]) << 16);
 }
-__device__ __forceinline__ void store_val(float* p, long i, float v) { p[i] = v; }
-__device__ __forceinline__ void store_val(_Float16* p, long i, float v) { p[i] = (_Float16)v; }
-__device__ __forceinline__ void store_val(bf16_t* p, long i, float v) {
+__device__ __forceinline__ void store_val(float* p, long long i, float v) { p[i] = v; }
+__device__ __forceinline__ void store_val(_Float16* p, long long i, float v) { p[i] = (_Float16)v; }
+__device__ __forceinline__ void store_val(bf16_t* p, long long i, float v) {
     unsigned int u = __float_as_uint(v);
     u += 0x7FFFu + ((u >> 16) & 1u);
     p[i] = (bf16_t)(u >> 16);
@@ -267,11 +278,11 @@ __device__ __forceinline__ void store_val(bf16_t* p, long i, float v) {
 // 8 tokens per 256-thread block, 32 threads per token.
 // gelu_in: the statistics of GELU(x2), rounded to T like a separate GELU.
 template <typename T>
-__device__ void sg_stats(const T* __restrict__ x, int C, long tokens, float eps,
+__device__ void sg_stats(const T* __restrict__ x, int C, long long tokens, float eps,
                          float* __restrict__ stats, int gelu_in) {
     __shared__ float s1[256], s2[256];
     const int lane = threadIdx.x & 31;
-    const long tok = (long)blockIdx.x * 8 + (threadIdx.x >> 5);
+    const long long tok = (long long)blockIdx.x * 8 + (threadIdx.x >> 5);
     float a = 0.0f, q = 0.0f;
     if (tok < tokens) {
         const T* row = x + tok * (2L * C) + C;
@@ -279,7 +290,7 @@ __device__ void sg_stats(const T* __restrict__ x, int C, long tokens, float eps,
             float v = load_val(row, c);
             if (gelu_in) {
                 T r;
-                store_val(&r, 0, 0.5f * v * (1.0f + erff(v * 0.70710678118654752f)));
+                store_val(&r, 0, 0.5f * v * (1.0f + fast_erff(v * 0.70710678118654752f)));
                 v = load_val(&r, 0);
             }
             a += v;
@@ -319,15 +330,15 @@ __device__ void sg_gate(const T* __restrict__ x, const float* __restrict__ stats
     const int b = blockIdx.z / chunks;
     const int c0 = (blockIdx.z % chunks) * CC;
     const int x0 = blockIdx.x * SX, y0 = blockIdx.y * SY;
-    const long L = (long)H * W;
-    const long C2 = 2L * C;
+    const long long L = (long long)H * W;
+    const long long C2 = 2L * C;
 
     for (int i = threadIdx.x; i < (SY + 2) * (SX + 2) * CC; i += 256) {
         const int c = i % CC, p = i / CC;
         const int gy = y0 + p / (SX + 2) - 1, gx = x0 + p % (SX + 2) - 1;
         float v = 0.0f;
         if (gy >= 0 && gy < H && gx >= 0 && gx < W && c0 + c < C) {
-            const long tok = (long)b * L + (long)gy * W + gx;
+            const long long tok = (long long)b * L + (long long)gy * W + gx;
             const float raw = load_val(x, tok * C2 + C + c0 + c);
             v = (raw - stats[tok * 2]) * stats[tok * 2 + 1] * gamma[c0 + c] + beta[c0 + c];
         }
@@ -353,14 +364,14 @@ __device__ void sg_gate(const T* __restrict__ x, const float* __restrict__ stats
             #pragma unroll
             for (int j = 0; j < 3; j++)
                 acc += k[i * 3 + j] * tile[((ty + i) * (SX + 2) + tx + j) * CC + c];
-        const long tok = (long)b * L + (long)oy * W + ox;
+        const long long tok = (long long)b * L + (long long)oy * W + ox;
         store_val(out, tok * C + c0 + c, acc * load_val(x, tok * C2 + c0 + c));
     }
 }
 
-extern "C" __global__ void sg_stats_f32(const float* x, int C, long tokens, float eps, float* stats, int gelu_in) { sg_stats<float>(x, C, tokens, eps, stats, gelu_in); }
-extern "C" __global__ void sg_stats_f16(const _Float16* x, int C, long tokens, float eps, float* stats, int gelu_in) { sg_stats<_Float16>(x, C, tokens, eps, stats, gelu_in); }
-extern "C" __global__ void sg_stats_bf16(const bf16_t* x, int C, long tokens, float eps, float* stats, int gelu_in) { sg_stats<bf16_t>(x, C, tokens, eps, stats, gelu_in); }
+extern "C" __global__ void sg_stats_f32(const float* x, int C, long long tokens, float eps, float* stats, int gelu_in) { sg_stats<float>(x, C, tokens, eps, stats, gelu_in); }
+extern "C" __global__ void sg_stats_f16(const _Float16* x, int C, long long tokens, float eps, float* stats, int gelu_in) { sg_stats<_Float16>(x, C, tokens, eps, stats, gelu_in); }
+extern "C" __global__ void sg_stats_bf16(const bf16_t* x, int C, long long tokens, float eps, float* stats, int gelu_in) { sg_stats<bf16_t>(x, C, tokens, eps, stats, gelu_in); }
 #define SG_ARGS const float* stats, const float* gamma, const float* beta, const float* w, const float* bias
 #define SG_PASS stats, gamma, beta, w, bias
 extern "C" __global__ void sg_gate_f32(const float* x, float* out, SG_ARGS, int C, int H, int W) { sg_gate<float>(x, SG_PASS, out, C, H, W); }
@@ -373,7 +384,7 @@ extern "C" __global__ void sg_gate_bf16(const bf16_t* x, bf16_t* out, SG_ARGS, i
 // can take e.g. the v part of a (B, L, 3C) qkv buffer directly, and writes a
 // contiguous (B, L, C). Same tiling as sg_gate.
 template <typename T>
-__device__ void dw_tokens(const T* __restrict__ x, long row_stride, int ch_offset,
+__device__ void dw_tokens(const T* __restrict__ x, long long row_stride, int ch_offset,
                           const float* __restrict__ w, const float* __restrict__ bias,
                           int gelu, T* __restrict__ out, int C, int H, int W) {
     __shared__ float tile[(SY + 2) * (SX + 2) * CC];
@@ -381,18 +392,18 @@ __device__ void dw_tokens(const T* __restrict__ x, long row_stride, int ch_offse
     const int b = blockIdx.z / chunks;
     const int c0 = (blockIdx.z % chunks) * CC;
     const int x0 = blockIdx.x * SX, y0 = blockIdx.y * SY;
-    const long L = (long)H * W;
+    const long long L = (long long)H * W;
 
     for (int i = threadIdx.x; i < (SY + 2) * (SX + 2) * CC; i += 256) {
         const int c = i % CC, p = i / CC;
         const int gy = y0 + p / (SX + 2) - 1, gx = x0 + p % (SX + 2) - 1;
         float v = 0.0f;
         if (gy >= 0 && gy < H && gx >= 0 && gx < W && c0 + c < C) {
-            const long tok = (long)b * L + (long)gy * W + gx;
+            const long long tok = (long long)b * L + (long long)gy * W + gx;
             v = load_val(x, tok * row_stride + ch_offset + c0 + c);
             if (gelu & 2) {
                 T r;
-                store_val(&r, 0, 0.5f * v * (1.0f + erff(v * 0.70710678118654752f)));
+                store_val(&r, 0, 0.5f * v * (1.0f + fast_erff(v * 0.70710678118654752f)));
                 v = load_val(&r, 0);
             }
         }
@@ -418,13 +429,13 @@ __device__ void dw_tokens(const T* __restrict__ x, long row_stride, int ch_offse
             #pragma unroll
             for (int j = 0; j < 3; j++)
                 acc += k[i * 3 + j] * tile[((ty + i) * (SX + 2) + tx + j) * CC + c];
-        if (gelu & 1) acc = 0.5f * acc * (1.0f + erff(acc * 0.70710678118654752f));
-        const long tok = (long)b * L + (long)oy * W + ox;
+        if (gelu & 1) acc = 0.5f * acc * (1.0f + fast_erff(acc * 0.70710678118654752f));
+        const long long tok = (long long)b * L + (long long)oy * W + ox;
         store_val(out, tok * C + c0 + c, acc);
     }
 }
 
-#define DWT_ARGS long row_stride, int ch_offset, const float* w, const float* bias, int gelu
+#define DWT_ARGS long long row_stride, int ch_offset, const float* w, const float* bias, int gelu
 #define DWT_PASS row_stride, ch_offset, w, bias, gelu
 extern "C" __global__ void dw_tokens_f32(const float* x, float* out, DWT_ARGS, int C, int H, int W) { dw_tokens<float>(x, DWT_PASS, out, C, H, W); }
 extern "C" __global__ void dw_tokens_f16(const _Float16* x, _Float16* out, DWT_ARGS, int C, int H, int W) { dw_tokens<_Float16>(x, DWT_PASS, out, C, H, W); }
@@ -439,24 +450,24 @@ extern "C" __global__ void dw_tokens_bf16(const bf16_t* x, bf16_t* out, DWT_ARGS
 #define DWV_CV 16
 #define DWV_TX 16
 #define DWV_TY 8
-__device__ __forceinline__ void load4(const float* p, long i, float v[4]) {
+__device__ __forceinline__ void load4(const float* p, long long i, float v[4]) {
     const float4 q = *(const float4*)(p + i);
     v[0] = q.x; v[1] = q.y; v[2] = q.z; v[3] = q.w;
 }
-__device__ __forceinline__ void load4(const _Float16* p, long i, float v[4]) {
+__device__ __forceinline__ void load4(const _Float16* p, long long i, float v[4]) {
     typedef _Float16 h4 __attribute__((ext_vector_type(4)));
     const h4 q = *(const h4*)(p + i);
     v[0] = (float)q.x; v[1] = (float)q.y; v[2] = (float)q.z; v[3] = (float)q.w;
 }
-__device__ __forceinline__ void load4(const bf16_t* p, long i, float v[4]) {
+__device__ __forceinline__ void load4(const bf16_t* p, long long i, float v[4]) {
     const uint2 q = *(const uint2*)(p + i);
     v[0] = __uint_as_float(q.x << 16); v[1] = __uint_as_float(q.x & 0xFFFF0000u);
     v[2] = __uint_as_float(q.y << 16); v[3] = __uint_as_float(q.y & 0xFFFF0000u);
 }
-__device__ __forceinline__ void store4(float* p, long i, const float v[4]) {
+__device__ __forceinline__ void store4(float* p, long long i, const float v[4]) {
     *(float4*)(p + i) = make_float4(v[0], v[1], v[2], v[3]);
 }
-__device__ __forceinline__ void store4(_Float16* p, long i, const float v[4]) {
+__device__ __forceinline__ void store4(_Float16* p, long long i, const float v[4]) {
     typedef _Float16 h4 __attribute__((ext_vector_type(4)));
     h4 q; q.x = (_Float16)v[0]; q.y = (_Float16)v[1]; q.z = (_Float16)v[2]; q.w = (_Float16)v[3];
     *(h4*)(p + i) = q;
@@ -465,19 +476,19 @@ __device__ __forceinline__ unsigned int bf16_bits(float v) {
     unsigned int u = __float_as_uint(v);
     return (u + 0x7FFFu + ((u >> 16) & 1u)) >> 16;
 }
-__device__ __forceinline__ void store4(bf16_t* p, long i, const float v[4]) {
+__device__ __forceinline__ void store4(bf16_t* p, long long i, const float v[4]) {
     *(uint2*)(p + i) = make_uint2(bf16_bits(v[0]) | (bf16_bits(v[1]) << 16),
                                   bf16_bits(v[2]) | (bf16_bits(v[3]) << 16));
 }
 
 template <typename T>
-__device__ __forceinline__ void dwv_load(const T* __restrict__ x, long row_stride, long base,
+__device__ __forceinline__ void dwv_load(const T* __restrict__ x, long long row_stride, long long base,
                                          int gy, int gx, int H, int W, float v[4]) {
     if (gy < 0 || gy >= H || gx < 0 || gx >= W) {
         v[0] = v[1] = v[2] = v[3] = 0.0f;
         return;
     }
-    load4(x, ((long)gy * W + gx) * row_stride + base, v);
+    load4(x, ((long long)gy * W + gx) * row_stride + base, v);
 }
 
 // GELU on the conv input, rounded to T like a separate PyTorch GELU
@@ -488,17 +499,48 @@ __device__ __forceinline__ float4 dwv_in(const float v[4], int gelu_in) {
     #pragma unroll
     for (int j = 0; j < 4; j++) {
         T r;
-        store_val(&r, 0, 0.5f * v[j] * (1.0f + erff(v[j] * 0.70710678118654752f)));
+        store_val(&r, 0, 0.5f * v[j] * (1.0f + fast_erff(v[j] * 0.70710678118654752f)));
         g[j] = load_val(&r, 0);
     }
     return make_float4(g[0], g[1], g[2], g[3]);
+}
+
+// sg_stats for C % 4 == 0 and 8-byte aligned rows: one wave32 per token, each
+// lane loads 4 channels at a time (8 bytes for 16-bit types) and the sums are
+// reduced with shuffles instead of shared memory and barriers.
+template <typename T>
+__device__ void sg_stats_v(const T* __restrict__ x, int C, long long tokens, float eps,
+                           float* __restrict__ stats, int gelu_in) {
+    const int lane = threadIdx.x & 31;
+    const long long tok = (long long)blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (tok >= tokens) return;
+    const long long row = tok * (2LL * C) + C;
+    float a = 0.0f, q = 0.0f;
+    for (int c = lane * 4; c < C; c += 128) {
+        float v[4];
+        load4(x, row + c, v);
+        const float4 g = dwv_in<T>(v, gelu_in);
+        a += (g.x + g.y) + (g.z + g.w);
+        q += (g.x * g.x + g.y * g.y) + (g.z * g.z + g.w * g.w);
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        a += __shfl_xor(a, o, 32);
+        q += __shfl_xor(q, o, 32);
+    }
+    if (lane == 0) {
+        const float mean = a / C;
+        const float var = fmaxf(q / C - mean * mean, 0.0f);
+        stats[tok * 2] = mean;
+        stats[tok * 2 + 1] = rsqrtf(var + eps);
+    }
 }
 
 // LayerNorm of a loaded value from its token's (mean, rstd); positions outside
 // the image stay zero (the conv's zero padding comes after the norm)
 __device__ __forceinline__ float4 dwv_norm(float4 v, const float* __restrict__ stats,
                                            const float* __restrict__ gamma,
-                                           const float* __restrict__ beta, int c, long tok,
+                                           const float* __restrict__ beta, int c, long long tok,
                                            bool inside) {
     if (!stats || !inside) return v;
     const float mean = stats[tok * 2], rstd = stats[tok * 2 + 1];
@@ -513,7 +555,7 @@ __device__ __forceinline__ float4 dwv_norm(float4 v, const float* __restrict__ s
 // [gate_off, gate_off + C) of the same token (GELU'd too with gelu & 2): that
 // is DAT's SpatialGate, x1 * dwconv(LayerNorm(x2)), on (B, L, 2C) rows.
 template <typename T>
-__device__ void dw_tokens_v(const T* __restrict__ x, long row_stride, int ch_offset,
+__device__ void dw_tokens_v(const T* __restrict__ x, long long row_stride, int ch_offset,
                             const float* __restrict__ w, const float* __restrict__ bias,
                             int gelu, T* __restrict__ out, int C, int H, int W,
                             const float* __restrict__ stats = nullptr,
@@ -534,10 +576,10 @@ __device__ void dw_tokens_v(const T* __restrict__ x, long row_stride, int ch_off
     // no early return: every thread takes part in the barriers
     const bool active = cv < vecs && ox < W;
     const int c = min(cv, vecs - 1) * 4;
-    const long L = (long)H * W;
-    const T* xb = x + (long)b * L * row_stride;
-    T* ob = out + (long)b * L * ld;
-    const long base = ch_offset + c;
+    const long long L = (long long)H * W;
+    const T* xb = x + (long long)b * L * row_stride;
+    T* ob = out + (long long)b * L * ld;
+    const long long base = ch_offset + c;
     const bool pad = cv >= vecs && cv * 4 < ld && ox < W;
     const int gin = gelu & 2;
     // the first and last column of the block also load the halo column
@@ -562,16 +604,16 @@ __device__ void dw_tokens_v(const T* __restrict__ x, long row_stride, int ch_off
     float m[4], h[4];
     dwv_load(xb, row_stride, base, y0 - 1, mx, H, W, m);
     if (hx != -2) dwv_load(xb, row_stride, base, y0 - 1, hxx, H, W, h);
-    const long tok_row = (long)b * L;
+    const long long tok_row = (long long)b * L;
     for (int y = y0 - 1; y <= y_end; y++) {
         float4 (*buf)[DWV_CV] = row[y & 1];
         const bool y_in = y >= 0 && y < H;
         buf[tx + 1][lv] = dwv_norm(dwv_in<T>(m, gin), stats, gamma, beta, c,
-                                   tok_row + (long)y * W + mx, y_in && mx >= 0 && mx < W);
+                                   tok_row + (long long)y * W + mx, y_in && mx >= 0 && mx < W);
         if (hx != -2)
             buf[tx == 0 ? 0 : DWV_TX + 1][lv] =
                 dwv_norm(dwv_in<T>(h, gin), stats, gamma, beta, c,
-                         tok_row + (long)y * W + hxx, y_in && hxx >= 0 && hxx < W);
+                         tok_row + (long long)y * W + hxx, y_in && hxx >= 0 && hxx < W);
         if (y < y_end) {
             dwv_load(xb, row_stride, base, y + 1, mx, H, W, m);
             if (hx != -2) dwv_load(xb, row_stride, base, y + 1, hxx, H, W, h);
@@ -593,18 +635,18 @@ __device__ void dw_tokens_v(const T* __restrict__ x, long row_stride, int ch_off
         if (active && y - 1 >= y0) {
             if (gelu & 1) {
                 #pragma unroll
-                for (int j = 0; j < 4; j++) o[j] = 0.5f * o[j] * (1.0f + erff(o[j] * 0.70710678118654752f));
+                for (int j = 0; j < 4; j++) o[j] = 0.5f * o[j] * (1.0f + fast_erff(o[j] * 0.70710678118654752f));
             }
             if (gate_off >= 0) {
                 float g[4];
-                load4(xb, ((long)(y - 1) * W + ox) * row_stride + gate_off + c, g);
+                load4(xb, ((long long)(y - 1) * W + ox) * row_stride + gate_off + c, g);
                 const float4 gq = dwv_in<T>(g, gin);
                 o[0] *= gq.x; o[1] *= gq.y; o[2] *= gq.z; o[3] *= gq.w;
             }
-            store4(ob, ((long)(y - 1) * W + ox) * ld + c, o);
+            store4(ob, ((long long)(y - 1) * W + ox) * ld + c, o);
         } else if (pad && y - 1 >= y0) {
             const float z[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-            store4(ob, ((long)(y - 1) * W + ox) * ld + cv * 4, z);
+            store4(ob, ((long long)(y - 1) * W + ox) * ld + cv * 4, z);
         }
     }
 }
@@ -614,6 +656,9 @@ extern "C" __global__ void __launch_bounds__(256) dw_tokens_v_f16(const _Float16
 extern "C" __global__ void __launch_bounds__(256) dw_tokens_v_bf16(const bf16_t* x, bf16_t* out, DWT_ARGS, int C, int H, int W) { dw_tokens_v<bf16_t>(x, DWT_PASS, out, C, H, W); }
 #define SGV_ARGS const float* stats, const float* gamma, const float* beta, int gate_off, int out_ld
 #define SGV_PASS stats, gamma, beta, gate_off, out_ld
+extern "C" __global__ void sg_stats_v_f32(const float* x, int C, long long tokens, float eps, float* stats, int gelu_in) { sg_stats_v<float>(x, C, tokens, eps, stats, gelu_in); }
+extern "C" __global__ void sg_stats_v_f16(const _Float16* x, int C, long long tokens, float eps, float* stats, int gelu_in) { sg_stats_v<_Float16>(x, C, tokens, eps, stats, gelu_in); }
+extern "C" __global__ void sg_stats_v_bf16(const bf16_t* x, int C, long long tokens, float eps, float* stats, int gelu_in) { sg_stats_v<bf16_t>(x, C, tokens, eps, stats, gelu_in); }
 extern "C" __global__ void __launch_bounds__(256) sg_gate_v_f32(const float* x, float* out, DWT_ARGS, int C, int H, int W, SGV_ARGS) { dw_tokens_v<float>(x, DWT_PASS, out, C, H, W, SGV_PASS); }
 extern "C" __global__ void __launch_bounds__(256) sg_gate_v_f16(const _Float16* x, _Float16* out, DWT_ARGS, int C, int H, int W, SGV_ARGS) { dw_tokens_v<_Float16>(x, DWT_PASS, out, C, H, W, SGV_PASS); }
 extern "C" __global__ void __launch_bounds__(256) sg_gate_v_bf16(const bf16_t* x, bf16_t* out, DWT_ARGS, int C, int H, int W, SGV_ARGS) { dw_tokens_v<bf16_t>(x, DWT_PASS, out, C, H, W, SGV_PASS); }
@@ -626,23 +671,23 @@ extern "C" __global__ void __launch_bounds__(256) sg_gate_v_bf16(const bf16_t* x
 // scheduling. Thread (i, 4 * j4 .. 4 * j4 + 3) accumulates gram[i][j].
 #define GR_TT 32
 template <typename T>
-__device__ void chan_gram(const T* __restrict__ qkv, int C, int nh, long N, long chunk_len,
+__device__ void chan_gram(const T* __restrict__ qkv, int C, int nh, long long N, long long chunk_len,
                           float* __restrict__ gram, float* __restrict__ sq) {
     __shared__ float qs[GR_TT][33], ks[GR_TT][33];
     const int d = C / nh;
     const int chunk = blockIdx.x, h = blockIdx.y, b = blockIdx.z;
     const int i = threadIdx.x >> 3, j0 = (threadIdx.x & 7) * 4;
-    const long n_begin = chunk * chunk_len;
-    const long n_end = min(N, n_begin + chunk_len);
-    const T* base = qkv + (long)b * N * 3 * C + h * d;
+    const long long n_begin = chunk * chunk_len;
+    const long long n_end = min(N, n_begin + chunk_len);
+    const T* base = qkv + (long long)b * N * 3 * C + h * d;
 
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f}, sq_q = 0.0f, sq_k[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    for (long n0 = n_begin; n0 < n_end; n0 += GR_TT) {
+    for (long long n0 = n_begin; n0 < n_end; n0 += GR_TT) {
         for (int e = threadIdx.x; e < GR_TT * 32; e += 256) {
             const int t = e >> 5, ch = e & 31;
             float q = 0.0f, k = 0.0f;
             if (ch < d && n0 + t < n_end) {
-                const long r = (n0 + t) * 3 * C + ch;
+                const long long r = (n0 + t) * 3 * C + ch;
                 q = load_val(base, r);
                 k = load_val(base, r + C);
             }
@@ -664,7 +709,7 @@ __device__ void chan_gram(const T* __restrict__ qkv, int C, int nh, long N, long
         __syncthreads();
     }
 
-    const long part = (long)chunk * gridDim.z + b;
+    const long long part = (long long)chunk * gridDim.z + b;
     float* g = gram + (part * nh + h) * d * d;
     #pragma unroll
     for (int jj = 0; jj < 4; jj++)
@@ -678,7 +723,7 @@ __device__ void chan_gram(const T* __restrict__ qkv, int C, int nh, long N, long
     }
 }
 
-#define GR_ARGS int C, int nh, long N, long chunk_len, float* gram, float* sq
+#define GR_ARGS int C, int nh, long long N, long long chunk_len, float* gram, float* sq
 #define GR_PASS C, nh, N, chunk_len, gram, sq
 extern "C" __global__ void __launch_bounds__(256) chan_gram_f32(const float* qkv, GR_ARGS) { chan_gram<float>(qkv, GR_PASS); }
 extern "C" __global__ void __launch_bounds__(256) chan_gram_f16(const _Float16* qkv, GR_ARGS) { chan_gram<_Float16>(qkv, GR_PASS); }
@@ -696,15 +741,17 @@ __device__ __forceinline__ float round_t(float v, const bf16_t*) {
     return __uint_as_float(u & 0xFFFF0000u);
 }
 
-template <typename T>
-__device__ void add_ln(const T* __restrict__ x, const T* __restrict__ a, T* __restrict__ sum_out,
-                       T* __restrict__ out, const float* __restrict__ gamma,
-                       const float* __restrict__ beta, int C, long tokens, float eps,
+// T: x and the sum; TA: the residual a; TO: the LayerNorm output. Mixed for an FP16
+// model's FP32 trunk (fp32_last_group): x, sum in float, a and out in _Float16.
+template <typename T, typename TA = T, typename TO = T>
+__device__ void add_ln(const T* __restrict__ x, const TA* __restrict__ a, T* __restrict__ sum_out,
+                       TO* __restrict__ out, const float* __restrict__ gamma,
+                       const float* __restrict__ beta, int C, long long tokens, float eps,
                        int out_ld) {
     const int lane = threadIdx.x & 31;
-    const long tok = (long)blockIdx.x * 8 + (threadIdx.x >> 5);
+    const long long tok = (long long)blockIdx.x * 8 + (threadIdx.x >> 5);
     if (tok >= tokens) return;
-    const long row = tok * C;
+    const long long row = tok * C;
     float v[8];
     float s = 0.0f;
     #pragma unroll
@@ -732,7 +779,7 @@ __device__ void add_ln(const T* __restrict__ x, const T* __restrict__ a, T* __re
     const float rstd = rsqrtf(q / C + eps);
     // out rows are out_ld wide, the columns past C zeroed (input of a GEMM
     // with K padded to out_ld)
-    const long orow = tok * out_ld;
+    const long long orow = tok * out_ld;
     #pragma unroll
     for (int k = 0; k < 8; k++) {
         const int c = lane + 32 * k;
@@ -741,6 +788,66 @@ __device__ void add_ln(const T* __restrict__ x, const T* __restrict__ a, T* __re
             store_val(out, orow + c, (v[k] - mean) * rstd * gamma[c] + beta[c]);
         } else if (c < out_ld) {
             store_val(out, orow + c, 0.0f);
+        }
+    }
+}
+
+// add_ln for C % 4 == 0 (and out_ld % 4 == 0): each lane holds 4 consecutive
+// channels (8-byte loads), up to 2 * 128 = 256 channels per token.
+template <typename T>
+__device__ void add_ln_v(const T* __restrict__ x, const T* __restrict__ a, T* __restrict__ sum_out,
+                         T* __restrict__ out, const float* __restrict__ gamma,
+                         const float* __restrict__ beta, int C, long long tokens, float eps,
+                         int out_ld) {
+    const int lane = threadIdx.x & 31;
+    const long long tok = (long long)blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (tok >= tokens) return;
+    const long long row = tok * C;
+    float v[2][4];
+    float s = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 2; k++) {
+        const int c = 4 * lane + 128 * k;
+        if (c < C) {
+            load4(x, row + c, v[k]);
+            if (a) {
+                float r[4];
+                load4(a, row + c, r);
+                #pragma unroll
+                for (int j = 0; j < 4; j++) v[k][j] = round_t(v[k][j] + r[j], x);
+            }
+        } else {
+            v[k][0] = v[k][1] = v[k][2] = v[k][3] = 0.0f;
+        }
+        s += (v[k][0] + v[k][1]) + (v[k][2] + v[k][3]);
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor(s, o, 32);
+    const float mean = s / C;
+    float q = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 2; k++) {
+        if (4 * lane + 128 * k < C) {
+            #pragma unroll
+            for (int j = 0; j < 4; j++) { const float dv = v[k][j] - mean; q += dv * dv; }
+        }
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) q += __shfl_xor(q, o, 32);
+    const float rstd = rsqrtf(q / C + eps);
+    const long long orow = tok * out_ld;
+    #pragma unroll
+    for (int k = 0; k < 2; k++) {
+        const int c = 4 * lane + 128 * k;
+        if (c < C) {
+            if (sum_out) store4(sum_out, row + c, v[k]);
+            float o[4];
+            #pragma unroll
+            for (int j = 0; j < 4; j++) o[j] = (v[k][j] - mean) * rstd * gamma[c + j] + beta[c + j];
+            store4(out, orow + c, o);
+        } else if (c < out_ld) {
+            const float z[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            store4(out, orow + c, z);
         }
     }
 }
@@ -757,11 +864,11 @@ __device__ void aim_ln(const T* __restrict__ x, const T* __restrict__ a, const T
                        const float* __restrict__ sw, const float* __restrict__ cgate,
                        T* __restrict__ sum_out, T* __restrict__ out,
                        const float* __restrict__ gamma, const float* __restrict__ beta,
-                       int C, long tokens, long L, float eps) {
+                       int C, long long tokens, long long L, float eps) {
     const int lane = threadIdx.x & 31;
-    const long tok = (long)blockIdx.x * 8 + (threadIdx.x >> 5);
+    const long long tok = (long long)blockIdx.x * 8 + (threadIdx.x >> 5);
     if (tok >= tokens) return;
-    const long row = tok * C;
+    const long long row = tok * C;
     float av[8], cv[8];
     float dot = 0.0f;
     #pragma unroll
@@ -817,16 +924,20 @@ __device__ void aim_ln(const T* __restrict__ x, const T* __restrict__ a, const T
     }
 }
 
-#define LN_ARGS const float* gamma, const float* beta, int C, long tokens, float eps
+#define LN_ARGS const float* gamma, const float* beta, int C, long long tokens, float eps
 #define LN_PASS gamma, beta, C, tokens, eps
 #define AIM_ARGS const float* sw, const float* cgate
 #define AIM_PASS sw, cgate
-extern "C" __global__ void aim_ln_f32(const float* x, const float* a, const float* c, AIM_ARGS, float* sum_out, float* out, LN_ARGS, long L) { aim_ln<float>(x, a, c, AIM_PASS, sum_out, out, gamma, beta, C, tokens, L, eps); }
-extern "C" __global__ void aim_ln_f16(const _Float16* x, const _Float16* a, const _Float16* c, AIM_ARGS, _Float16* sum_out, _Float16* out, LN_ARGS, long L) { aim_ln<_Float16>(x, a, c, AIM_PASS, sum_out, out, gamma, beta, C, tokens, L, eps); }
-extern "C" __global__ void aim_ln_bf16(const bf16_t* x, const bf16_t* a, const bf16_t* c, AIM_ARGS, bf16_t* sum_out, bf16_t* out, LN_ARGS, long L) { aim_ln<bf16_t>(x, a, c, AIM_PASS, sum_out, out, gamma, beta, C, tokens, L, eps); }
+extern "C" __global__ void aim_ln_f32(const float* x, const float* a, const float* c, AIM_ARGS, float* sum_out, float* out, LN_ARGS, long long L) { aim_ln<float>(x, a, c, AIM_PASS, sum_out, out, gamma, beta, C, tokens, L, eps); }
+extern "C" __global__ void aim_ln_f16(const _Float16* x, const _Float16* a, const _Float16* c, AIM_ARGS, _Float16* sum_out, _Float16* out, LN_ARGS, long long L) { aim_ln<_Float16>(x, a, c, AIM_PASS, sum_out, out, gamma, beta, C, tokens, L, eps); }
+extern "C" __global__ void aim_ln_bf16(const bf16_t* x, const bf16_t* a, const bf16_t* c, AIM_ARGS, bf16_t* sum_out, bf16_t* out, LN_ARGS, long long L) { aim_ln<bf16_t>(x, a, c, AIM_PASS, sum_out, out, gamma, beta, C, tokens, L, eps); }
+extern "C" __global__ void add_ln_v_f32(const float* x, const float* a, float* sum_out, float* out, LN_ARGS, int out_ld) { add_ln_v<float>(x, a, sum_out, out, LN_PASS, out_ld); }
+extern "C" __global__ void add_ln_v_f16(const _Float16* x, const _Float16* a, _Float16* sum_out, _Float16* out, LN_ARGS, int out_ld) { add_ln_v<_Float16>(x, a, sum_out, out, LN_PASS, out_ld); }
+extern "C" __global__ void add_ln_v_bf16(const bf16_t* x, const bf16_t* a, bf16_t* sum_out, bf16_t* out, LN_ARGS, int out_ld) { add_ln_v<bf16_t>(x, a, sum_out, out, LN_PASS, out_ld); }
 extern "C" __global__ void add_ln_f32(const float* x, const float* a, float* sum_out, float* out, LN_ARGS, int out_ld) { add_ln<float>(x, a, sum_out, out, LN_PASS, out_ld); }
 extern "C" __global__ void add_ln_f16(const _Float16* x, const _Float16* a, _Float16* sum_out, _Float16* out, LN_ARGS, int out_ld) { add_ln<_Float16>(x, a, sum_out, out, LN_PASS, out_ld); }
 extern "C" __global__ void add_ln_bf16(const bf16_t* x, const bf16_t* a, bf16_t* sum_out, bf16_t* out, LN_ARGS, int out_ld) { add_ln<bf16_t>(x, a, sum_out, out, LN_PASS, out_ld); }
+extern "C" __global__ void add_ln_f32_f16(const float* x, const _Float16* a, float* sum_out, _Float16* out, LN_ARGS, int out_ld) { add_ln<float, _Float16, _Float16>(x, a, sum_out, out, LN_PASS, out_ld); }
 
 // HAT's HAB residual and second LayerNorm in one pass:
 //   sum = (x + a) + (conv * ca[b, c]) * scale     (each op rounded to T, as in
@@ -841,15 +952,15 @@ __device__ void hab_ln(const T* __restrict__ x, const T* __restrict__ a,
                        const TC* __restrict__ conv, const float* __restrict__ ca,
                        float scale, T* __restrict__ sum_out, T* __restrict__ out,
                        const float* __restrict__ gamma, const float* __restrict__ beta,
-                       int C, long L, long tokens, float eps) {
+                       int C, long long L, long long tokens, float eps) {
     __shared__ float tile[256 * 33];
-    const long t0 = (long)blockIdx.x * 32;
+    const long long t0 = (long long)blockIdx.x * 32;
     for (int i = threadIdx.x; i < C * 32; i += 256) {
         const int c = i / 32, j = i % 32;
-        const long tok = t0 + j;
+        const long long tok = t0 + j;
         float v = 0.0f;
         if (tok < tokens) {
-            const long b = tok / L, p = tok - b * L;
+            const long long b = tok / L, p = tok - b * L;
             v = load_val(conv, (b * C + c) * L + p);
         }
         tile[c * 33 + j] = v;
@@ -858,10 +969,10 @@ __device__ void hab_ln(const T* __restrict__ x, const T* __restrict__ a,
 
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
     for (int j = wave; j < 32; j += 8) {
-        const long tok = t0 + j;
+        const long long tok = t0 + j;
         if (tok >= tokens) break;
-        const long b = tok / L;
-        const long row = tok * C;
+        const long long b = tok / L;
+        const long long row = tok * C;
         float v[8];
         float s = 0.0f;
         #pragma unroll
@@ -898,11 +1009,11 @@ __device__ void hab_ln(const T* __restrict__ x, const T* __restrict__ a,
     }
 }
 
-#define HAB_SIG(T, S) extern "C" __global__ void hab_ln_##S(const T* x, const T* a, const T* conv, const float* ca, float scale, T* sum_out, T* out, const float* gamma, const float* beta, int C, long L, long tokens, float eps) { hab_ln<T>(x, a, conv, ca, scale, sum_out, out, gamma, beta, C, L, tokens, eps); }
+#define HAB_SIG(T, S) extern "C" __global__ void hab_ln_##S(const T* x, const T* a, const T* conv, const float* ca, float scale, T* sum_out, T* out, const float* gamma, const float* beta, int C, long long L, long long tokens, float eps) { hab_ln<T>(x, a, conv, ca, scale, sum_out, out, gamma, beta, C, L, tokens, eps); }
 HAB_SIG(float, f32)
 HAB_SIG(_Float16, f16)
 HAB_SIG(bf16_t, bf16)
-extern "C" __global__ void hab_ln_bf16_c16(const bf16_t* x, const bf16_t* a, const _Float16* conv, const float* ca, float scale, bf16_t* sum_out, bf16_t* out, const float* gamma, const float* beta, int C, long L, long tokens, float eps) { hab_ln<bf16_t, _Float16>(x, a, conv, ca, scale, sum_out, out, gamma, beta, C, L, tokens, eps); }
+extern "C" __global__ void hab_ln_bf16_c16(const bf16_t* x, const bf16_t* a, const _Float16* conv, const float* ca, float scale, bf16_t* sum_out, bf16_t* out, const float* gamma, const float* beta, int C, long long L, long long tokens, float eps) { hab_ln<bf16_t, _Float16>(x, a, conv, ca, scale, sum_out, out, gamma, beta, C, L, tokens, eps); }
 
 // LayerNorm over token rows like add_ln (no residual), also writing the result
 // in the image layout (B, C, L) for a following convolution, which otherwise
@@ -912,14 +1023,14 @@ extern "C" __global__ void hab_ln_bf16_c16(const bf16_t* x, const bf16_t* a, con
 template <typename T, typename TI = T>
 __device__ void ln_nchw(const T* __restrict__ x, T* __restrict__ out, TI* __restrict__ img,
                         const float* __restrict__ gamma, const float* __restrict__ beta,
-                        int C, long L, long tokens, float eps) {
+                        int C, long long L, long long tokens, float eps) {
     __shared__ float tile[256 * 33];
-    const long t0 = (long)blockIdx.x * 32;
+    const long long t0 = (long long)blockIdx.x * 32;
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
     for (int j = wave; j < 32; j += 8) {
-        const long tok = t0 + j;
+        const long long tok = t0 + j;
         if (tok >= tokens) break;
-        const long row = tok * C;
+        const long long row = tok * C;
         float v[8];
         float s = 0.0f;
         #pragma unroll
@@ -955,18 +1066,18 @@ __device__ void ln_nchw(const T* __restrict__ x, T* __restrict__ out, TI* __rest
     __syncthreads();
     for (int i = threadIdx.x; i < C * 32; i += 256) {
         const int c = i / 32, j = i % 32;
-        const long tok = t0 + j;
+        const long long tok = t0 + j;
         if (tok >= tokens) continue;
-        const long b = tok / L, p = tok - b * L;
+        const long long b = tok / L, p = tok - b * L;
         store_val(img, (b * C + c) * L + p, tile[c * 33 + j]);
     }
 }
 
-#define LNI_SIG(T, S) extern "C" __global__ void ln_nchw_##S(const T* x, T* out, T* img, const float* gamma, const float* beta, int C, long L, long tokens, float eps) { ln_nchw<T>(x, out, img, gamma, beta, C, L, tokens, eps); }
+#define LNI_SIG(T, S) extern "C" __global__ void ln_nchw_##S(const T* x, T* out, T* img, const float* gamma, const float* beta, int C, long long L, long long tokens, float eps) { ln_nchw<T>(x, out, img, gamma, beta, C, L, tokens, eps); }
 LNI_SIG(float, f32)
 LNI_SIG(_Float16, f16)
 LNI_SIG(bf16_t, bf16)
-extern "C" __global__ void ln_nchw_bf16_i16(const bf16_t* x, bf16_t* out, _Float16* img, const float* gamma, const float* beta, int C, long L, long tokens, float eps) { ln_nchw<bf16_t, _Float16>(x, out, img, gamma, beta, C, L, tokens, eps); }
+extern "C" __global__ void ln_nchw_bf16_i16(const bf16_t* x, bf16_t* out, _Float16* img, const float* gamma, const float* beta, int C, long long L, long long tokens, float eps) { ln_nchw<bf16_t, _Float16>(x, out, img, gamma, beta, C, L, tokens, eps); }
 
 // DAT's Adaptive Interaction gating, in one pass over (B, N, C):
 //   out = a * sigmoid(tok[b, n]) + b * sigmoid(ch[b, c])   (a_uses_tok = 1)
@@ -975,11 +1086,11 @@ extern "C" __global__ void ln_nchw_bf16_i16(const bf16_t* x, bf16_t* out, _Float
 template <typename T>
 __device__ void gate_mix(const T* __restrict__ a, const T* __restrict__ bt,
                          const T* __restrict__ tok, const T* __restrict__ ch,
-                         T* __restrict__ out, int C, long N, long total, int a_uses_tok) {
-    for (long i = (long)blockIdx.x * 256 + threadIdx.x; i < total; i += (long)gridDim.x * 256) {
-        const long t = i / C;
+                         T* __restrict__ out, int C, long long N, long long total, int a_uses_tok) {
+    for (long long i = (long long)blockIdx.x * 256 + threadIdx.x; i < total; i += (long long)gridDim.x * 256) {
+        const long long t = i / C;
         const int c = (int)(i - t * C);
-        const long bi = t / N;
+        const long long bi = t / N;
         const float ts = 1.0f / (1.0f + __expf(-load_val(tok, t)));
         const float cs = 1.0f / (1.0f + __expf(-load_val(ch, bi * C + c)));
         const float va = load_val(a, i), vb = load_val(bt, i);
@@ -992,18 +1103,18 @@ __device__ void gate_mix(const T* __restrict__ a, const T* __restrict__ bt,
 template <typename T>
 __device__ void gate_mix_v(const T* __restrict__ a, const T* __restrict__ bt,
                            const T* __restrict__ tok, const T* __restrict__ ch,
-                           T* __restrict__ out, int C, long N, long total, int a_uses_tok,
+                           T* __restrict__ out, int C, long long N, long long total, int a_uses_tok,
                            int out_ld) {
     const int vecs = out_ld / 4;
-    for (long q = (long)blockIdx.x * 256 + threadIdx.x; q < total / C * vecs; q += (long)gridDim.x * 256) {
-        const long t = q / vecs;
+    for (long long q = (long long)blockIdx.x * 256 + threadIdx.x; q < total / C * vecs; q += (long long)gridDim.x * 256) {
+        const long long t = q / vecs;
         const int c = (int)(q - t * vecs) * 4;
         if (c >= C) {
             const float z[4] = {0.0f, 0.0f, 0.0f, 0.0f};
             store4(out, t * out_ld + c, z);
             continue;
         }
-        const long i = t * C + c;
+        const long long i = t * C + c;
         const float ts = 1.0f / (1.0f + __expf(-load_val(tok, t)));
         const T* chb = ch + (t / N) * C + c;
         float va[4], vb[4], o[4];
@@ -1018,14 +1129,14 @@ __device__ void gate_mix_v(const T* __restrict__ a, const T* __restrict__ bt,
     }
 }
 
-#define GM_ARGS int C, long N, long total, int a_uses_tok, int out_ld
+#define GM_ARGS int C, long long N, long long total, int a_uses_tok, int out_ld
 #define GM_PASS C, N, total, a_uses_tok, out_ld
 extern "C" __global__ void gate_mix_v_f32(const float* a, const float* b, const float* tok, const float* ch, float* out, GM_ARGS) { gate_mix_v<float>(a, b, tok, ch, out, GM_PASS); }
 extern "C" __global__ void gate_mix_v_f16(const _Float16* a, const _Float16* b, const _Float16* tok, const _Float16* ch, _Float16* out, GM_ARGS) { gate_mix_v<_Float16>(a, b, tok, ch, out, GM_PASS); }
 extern "C" __global__ void gate_mix_v_bf16(const bf16_t* a, const bf16_t* b, const bf16_t* tok, const bf16_t* ch, bf16_t* out, GM_ARGS) { gate_mix_v<bf16_t>(a, b, tok, ch, out, GM_PASS); }
-extern "C" __global__ void gate_mix_f32(const float* a, const float* b, const float* tok, const float* ch, float* out, int C, long N, long total, int a_uses_tok) { gate_mix<float>(a, b, tok, ch, out, C, N, total, a_uses_tok); }
-extern "C" __global__ void gate_mix_f16(const _Float16* a, const _Float16* b, const _Float16* tok, const _Float16* ch, _Float16* out, int C, long N, long total, int a_uses_tok) { gate_mix<_Float16>(a, b, tok, ch, out, C, N, total, a_uses_tok); }
-extern "C" __global__ void gate_mix_bf16(const bf16_t* a, const bf16_t* b, const bf16_t* tok, const bf16_t* ch, bf16_t* out, int C, long N, long total, int a_uses_tok) { gate_mix<bf16_t>(a, b, tok, ch, out, C, N, total, a_uses_tok); }
+extern "C" __global__ void gate_mix_f32(const float* a, const float* b, const float* tok, const float* ch, float* out, int C, long long N, long long total, int a_uses_tok) { gate_mix<float>(a, b, tok, ch, out, C, N, total, a_uses_tok); }
+extern "C" __global__ void gate_mix_f16(const _Float16* a, const _Float16* b, const _Float16* tok, const _Float16* ch, _Float16* out, int C, long long N, long long total, int a_uses_tok) { gate_mix<_Float16>(a, b, tok, ch, out, C, N, total, a_uses_tok); }
+extern "C" __global__ void gate_mix_bf16(const bf16_t* a, const bf16_t* b, const bf16_t* tok, const bf16_t* ch, bf16_t* out, int C, long long N, long long total, int a_uses_tok) { gate_mix<bf16_t>(a, b, tok, ch, out, C, N, total, a_uses_tok); }
 """
 
 _ATTN_WMMA_SRC = r"""
@@ -1070,9 +1181,9 @@ __device__ __forceinline__ v8f mma(v8s a, v8s b, v8f c) {
 }
 
 template <bool BF16, int KD>
-__device__ void win_attn_wmma(const u16* __restrict__ qkv, long s0, long s1, long s2, long s3,
+__device__ void win_attn_wmma(const u16* __restrict__ qkv, long long s0, long long s1, long long s2, long long s3,
                               const float* __restrict__ biasT, const int* __restrict__ labels,
-                              u16* __restrict__ out, long out_stride, int out_off, int Hc, int Wc,
+                              u16* __restrict__ out, long long out_stride, int out_off, int Hc, int Wc,
                               int sy, int sx, int H, int W, int H_sp, int W_sp,
                               int heads, int d, float scale) {
     constexpr int KS = KD / 16;  // k steps over the head dim, and O column tiles
@@ -1102,7 +1213,7 @@ __device__ void win_attn_wmma(const u16* __restrict__ qkv, long s0, long s1, lon
         if (ys >= H) ys -= H;
         if (xs >= W) xs -= W;
         const bool in = j < d && ys < Hc && xs < Wc;  // window padding is zero
-        const long base = (long)b * s1 + ((long)ys * Wc + xs) * s2 + (long)(h * d + j) * s3;
+        const long long base = (long long)b * s1 + ((long long)ys * Wc + xs) * s2 + (long long)(h * d + j) * s3;
         Ks[t * KD + j] = in ? qkv[s0 + base] : (u16)0;
         Vt[j * NV + t] = in ? qkv[2 * s0 + base] : (u16)0;
     }
@@ -1122,7 +1233,7 @@ __device__ void win_attn_wmma(const u16* __restrict__ qkv, long s0, long s1, lon
             const int y = ih * H_sp + n / W_sp, x = iw * W_sp + n % W_sp;
             const int ys = (y + sy) % H, xs = (x + sx) % W;
             const bool valid = ys < Hc && xs < Wc;
-            const long base = (long)b * s1 + ((long)ys * Wc + xs) * s2 + (long)(h * d) * s3;
+            const long long base = (long long)b * s1 + ((long long)ys * Wc + xs) * s2 + (long long)(h * d) * s3;
             #pragma unroll
             for (int s = 0; s < KS; s++)
                 #pragma unroll
@@ -1166,7 +1277,7 @@ __device__ void win_attn_wmma(const u16* __restrict__ qkv, long s0, long s1, lon
                     sacc = mma<BF16>(qa[s], kb, sacc);
                 }
                 const int klab = labels ? labs[key] : 0;
-                const float* brow = biasT ? biasT + ((long)h * N + key) * N + q0 : nullptr;
+                const float* brow = biasT ? biasT + ((long long)h * N + key) * N + q0 : nullptr;
                 v4f b0 = {0, 0, 0, 0}, b1 = {0, 0, 0, 0};
                 if (brow) { b0 = *(const v4f*)brow; b1 = *(const v4f*)(brow + 4); }
                 #pragma unroll
@@ -1233,7 +1344,7 @@ __device__ void win_attn_wmma(const u16* __restrict__ qkv, long s0, long s1, lon
             ls += __shfl_xor(ls, 8, 16);
             if (ys >= Hc || xs >= Wc) continue;
             const float inv = 1.0f / ls;
-            const long ob = (((long)b * Hc + ys) * Wc + xs) * out_stride + out_off + h * d;
+            const long long ob = (((long long)b * Hc + ys) * Wc + xs) * out_stride + out_off + h * d;
             #pragma unroll
             for (int t = 0; t < KS; t++) {
                 const int j = t * 16 + col;
@@ -1243,7 +1354,7 @@ __device__ void win_attn_wmma(const u16* __restrict__ qkv, long s0, long s1, lon
     }
 }
 
-#define WMMA_ARGS long s0, long s1, long s2, long s3, const float* biasT, const int* labels, long out_stride, int out_off, int Hc, int Wc, int sy, int sx, int H, int W, int H_sp, int W_sp, int heads, int d, float scale
+#define WMMA_ARGS long long s0, long long s1, long long s2, long long s3, const float* biasT, const int* labels, long long out_stride, int out_off, int Hc, int Wc, int sy, int sx, int H, int W, int H_sp, int W_sp, int heads, int d, float scale
 #define WMMA_PASS s0, s1, s2, s3, biasT, labels, out, out_stride, out_off, Hc, Wc, sy, sx, H, W, H_sp, W_sp, heads, d, scale
 extern "C" __global__ void __launch_bounds__(256) win_attn_wmma_bf16_32(const u16* qkv, u16* out, WMMA_ARGS) { win_attn_wmma<true, 32>(qkv, WMMA_PASS); }
 extern "C" __global__ void __launch_bounds__(256) win_attn_wmma_bf16_64(const u16* qkv, u16* out, WMMA_ARGS) { win_attn_wmma<true, 64>(qkv, WMMA_PASS); }
@@ -1276,7 +1387,7 @@ _OCAB_SRC = (
 // past ows*ows (padding to a multiple of 16) score -inf.
 
 template <bool BF16, int KD>
-__device__ void ocab_wmma(const u16* __restrict__ qkv, long s0, long s1, long s2, long s3,
+__device__ void ocab_wmma(const u16* __restrict__ qkv, long long s0, long long s1, long long s2, long long s3,
                           const float* __restrict__ biasT, u16* __restrict__ out,
                           int H, int W, int ws, int ows, int heads, int d, float scale,
                           int chunk) {
@@ -1317,7 +1428,7 @@ __device__ void ocab_wmma(const u16* __restrict__ qkv, long s0, long s1, long s2
         if (qt < ntiles) {
             const int n = qt * 16 + col;
             const int y = iy * ws + n / ws, x = ix * ws + n % ws;
-            const long base = (long)b * s1 + ((long)y * W + x) * s2 + (long)(h * d) * s3;
+            const long long base = (long long)b * s1 + ((long long)y * W + x) * s2 + (long long)(h * d) * s3;
             #pragma unroll
             for (int s = 0; s < KS; s++)
                 #pragma unroll
@@ -1337,7 +1448,7 @@ __device__ void ocab_wmma(const u16* __restrict__ qkv, long s0, long s1, long s2
             const int key = c0 + t;
             const int y = ky0 + key / ows, x = kx0 + key % ows;
             const bool in = j < d && key < NK && y >= 0 && y < H && x >= 0 && x < W;
-            const long base = in ? (long)b * s1 + ((long)y * W + x) * s2 + (long)(h * d + j) * s3 : 0;
+            const long long base = in ? (long long)b * s1 + ((long long)y * W + x) * s2 + (long long)(h * d + j) * s3 : 0;
             Ks[t * KD + j] = in ? qkv[s0 + base] : (u16)0;
             Vt[j * CV + t] = in ? qkv[2 * s0 + base] : (u16)0;
         }
@@ -1368,7 +1479,7 @@ __device__ void ocab_wmma(const u16* __restrict__ qkv, long s0, long s1, long s2
                         sacc = mma<BF16>(qa[tt][s], kb, sacc);
                     }
                     if (key < NK) {
-                        const float* brow = biasT + ((long)h * NK + key) * NQ + q0;
+                        const float* brow = biasT + ((long long)h * NK + key) * NQ + q0;
                         const v4f b0 = *(const v4f*)brow, b1 = *(const v4f*)(brow + 4);
                         #pragma unroll
                         for (int i = 0; i < 8; i++)
@@ -1429,7 +1540,7 @@ __device__ void ocab_wmma(const u16* __restrict__ qkv, long s0, long s1, long s2
             ls += __shfl_xor(ls, 4, 16);
             ls += __shfl_xor(ls, 8, 16);
             const float inv = 1.0f / ls;
-            const long ob = (((long)b * H + y) * W + x) * (long)(heads * d) + h * d;
+            const long long ob = (((long long)b * H + y) * W + x) * (long long)(heads * d) + h * d;
             #pragma unroll
             for (int t = 0; t < KS; t++) {
                 const int j = t * 16 + col;
@@ -1439,7 +1550,7 @@ __device__ void ocab_wmma(const u16* __restrict__ qkv, long s0, long s1, long s2
     }
 }
 
-#define OCAB_ARGS long s0, long s1, long s2, long s3, const float* biasT, int H, int W, int ws, int ows, int heads, int d, float scale, int chunk
+#define OCAB_ARGS long long s0, long long s1, long long s2, long long s3, const float* biasT, int H, int W, int ws, int ows, int heads, int d, float scale, int chunk
 #define OCAB_PASS s0, s1, s2, s3, biasT, out, H, W, ws, ows, heads, d, scale, chunk
 extern "C" __global__ void __launch_bounds__(256) ocab_wmma_bf16_16(const u16* qkv, u16* out, OCAB_ARGS) { ocab_wmma<true, 16>(qkv, OCAB_PASS); }
 extern "C" __global__ void __launch_bounds__(256) ocab_wmma_bf16_32(const u16* qkv, u16* out, OCAB_ARGS) { ocab_wmma<true, 32>(qkv, OCAB_PASS); }
@@ -1453,9 +1564,9 @@ extern "C" __global__ void __launch_bounds__(256) ocab_wmma_f16_64(const u16* qk
 _RRDB_SRC = r"""
 typedef unsigned short bf16_t;
 
-__device__ __forceinline__ float load_val(const float* p, long i) { return p[i]; }
-__device__ __forceinline__ float load_val(const _Float16* p, long i) { return (float)p[i]; }
-__device__ __forceinline__ float load_val(const bf16_t* p, long i) {
+__device__ __forceinline__ float load_val(const float* p, long long i) { return p[i]; }
+__device__ __forceinline__ float load_val(const _Float16* p, long long i) { return (float)p[i]; }
+__device__ __forceinline__ float load_val(const bf16_t* p, long long i) {
     return __uint_as_float(((unsigned int)p[i]) << 16);
 }
 __device__ __forceinline__ unsigned short bf16_bits(float v) {
@@ -1463,9 +1574,9 @@ __device__ __forceinline__ unsigned short bf16_bits(float v) {
     u += 0x7FFFu + ((u >> 16) & 1u);
     return (unsigned short)(u >> 16);
 }
-__device__ __forceinline__ void store_val(float* p, long i, float v) { p[i] = v; }
-__device__ __forceinline__ void store_val(_Float16* p, long i, float v) { p[i] = (_Float16)v; }
-__device__ __forceinline__ void store_val(bf16_t* p, long i, float v) { p[i] = bf16_bits(v); }
+__device__ __forceinline__ void store_val(float* p, long long i, float v) { p[i] = v; }
+__device__ __forceinline__ void store_val(_Float16* p, long long i, float v) { p[i] = (_Float16)v; }
+__device__ __forceinline__ void store_val(bf16_t* p, long long i, float v) { p[i] = bf16_bits(v); }
 
 // Rounds a float to T and back, as PyTorch does after every elementwise op.
 __device__ __forceinline__ float round_to(const float*, float v) { return v; }
@@ -1483,12 +1594,12 @@ __device__ __forceinline__ float round_to(const bf16_t*, float v) {
 
 // dst[off:off+C] = act(src), act = LeakyReLU(slope) or ReLU.
 template <typename T>
-__device__ void act_into(const T* __restrict__ src, T* __restrict__ dst, long n,
-                         long dst_stride, long dst_off, float slope, int relu) {
-    const long b = blockIdx.y;
+__device__ void act_into(const T* __restrict__ src, T* __restrict__ dst, long long n,
+                         long long dst_stride, long long dst_off, float slope, int relu) {
+    const long long b = blockIdx.y;
     const T* s = src + b * n;
     T* d = dst + b * dst_stride + dst_off;
-    for (long i = (long)blockIdx.x * 256 + threadIdx.x; i < n; i += (long)gridDim.x * 256) {
+    for (long long i = (long long)blockIdx.x * 256 + threadIdx.x; i < n; i += (long long)gridDim.x * 256) {
         float v = load_val(s, i);
         store_val(d, i, v > 0.0f ? v : (relu ? 0.0f : v * slope));
     }
@@ -1497,15 +1608,15 @@ __device__ void act_into(const T* __restrict__ src, T* __restrict__ dst, long n,
 // dst = a * s1 + x1, then optionally * s2 + x2, rounding to T after every
 // multiply and add like the separate PyTorch ops do.
 template <typename T>
-__device__ void res_add(const T* __restrict__ a, const T* __restrict__ x1, long x1_stride,
-                        const T* __restrict__ x2, long x2_stride, T* __restrict__ dst,
-                        long dst_stride, long n, float s1, float s2, int two) {
-    const long b = blockIdx.y;
+__device__ void res_add(const T* __restrict__ a, const T* __restrict__ x1, long long x1_stride,
+                        const T* __restrict__ x2, long long x2_stride, T* __restrict__ dst,
+                        long long dst_stride, long long n, float s1, float s2, int two) {
+    const long long b = blockIdx.y;
     const T* pa = a + b * n;
     const T* p1 = x1 + b * x1_stride;
     const T* p2 = two ? x2 + b * x2_stride : nullptr;
     T* d = dst + b * dst_stride;
-    for (long i = (long)blockIdx.x * 256 + threadIdx.x; i < n; i += (long)gridDim.x * 256) {
+    for (long long i = (long long)blockIdx.x * 256 + threadIdx.x; i < n; i += (long long)gridDim.x * 256) {
         float t = round_to(d, load_val(pa, i) * s1);
         t = round_to(d, t + load_val(p1, i));
         if (two) {
@@ -1517,13 +1628,13 @@ __device__ void res_add(const T* __restrict__ a, const T* __restrict__ x1, long 
 }
 
 #define RRDB_KERNELS(T, S)                                                                   \
-    extern "C" __global__ void act_into_##S(const T* src, T* dst, long n, long dst_stride,   \
-                                            long dst_off, float slope, int relu) {           \
+    extern "C" __global__ void act_into_##S(const T* src, T* dst, long long n, long long dst_stride,   \
+                                            long long dst_off, float slope, int relu) {           \
         act_into<T>(src, dst, n, dst_stride, dst_off, slope, relu);                          \
     }                                                                                        \
-    extern "C" __global__ void res_add_##S(const T* a, const T* x1, long x1_stride,          \
-                                           const T* x2, long x2_stride, T* dst,              \
-                                           long dst_stride, long n, float s1, float s2,      \
+    extern "C" __global__ void res_add_##S(const T* a, const T* x1, long long x1_stride,          \
+                                           const T* x2, long long x2_stride, T* dst,              \
+                                           long long dst_stride, long long n, float s1, float s2,      \
                                            int two) {                                        \
         res_add<T>(a, x1, x1_stride, x2, x2_stride, dst, dst_stride, n, s1, s2, two);        \
     }
@@ -1561,8 +1672,11 @@ _PROGRAMS: dict[str, tuple[str, list[str], list[str]]] = {
         + [f"dw_tokens_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"dw_tokens_v_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"sg_gate_v_{s}" for s in _DTYPE_SUFFIX.values()]
+        + [f"sg_stats_v_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"chan_gram_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"add_ln_{s}" for s in _DTYPE_SUFFIX.values()]
+        + ["add_ln_f32_f16"]
+        + [f"add_ln_v_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"aim_ln_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"gate_mix_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"gate_mix_v_{s}" for s in _DTYPE_SUFFIX.values()]
@@ -1588,6 +1702,8 @@ class _Hip:
         self.hip = ctypes.WinDLL(str(next(bin_dir.glob("amdhip64*.dll"))))
         self.rtc = ctypes.WinDLL(str(next(bin_dir.glob("hiprtc0*.dll"))))
         self.funcs: dict[tuple[int, str], ctypes.c_void_p] = {}
+        # function handle -> the device whose context it was loaded in
+        self.fn_device: dict[int | None, int] = {}
         self.compiled: set[tuple[int, str]] = set()
         self.lock = threading.Lock()
 
@@ -1663,6 +1779,7 @@ class _Hip:
                     "hipModuleGetFunction",
                 )
                 funcs[(device_index, name)] = fn
+                self.fn_device[fn.value] = device_index
             self.funcs.update(funcs)
 
     def _compile(self, device_index: int, program: str) -> None:
@@ -1738,12 +1855,21 @@ class _Hip:
         params = (ctypes.c_void_p * len(args))(
             *[ctypes.cast(ctypes.byref(a), ctypes.c_void_p) for a in args]
         )
-        self._check(
-            self.hip.hipModuleLaunchKernel(
+        # The launch goes to the current device: the default stream's handle is 0,
+        # the null stream of whichever device is current, and fn belongs to the
+        # device it was loaded on. Make that device current if it is not
+        # (Rift73/spandrel 3e11fdd).
+        device = self.fn_device.get(fn.value)
+        if device is not None and device != torch.cuda.current_device():
+            with torch.cuda.device(device):
+                err = self.hip.hipModuleLaunchKernel(
+                    fn, *grid, *block, shared_mem, stream, params, None
+                )
+        else:
+            err = self.hip.hipModuleLaunchKernel(
                 fn, *grid, *block, shared_mem, stream, params, None
-            ),
-            "hipModuleLaunchKernel",
-        )
+            )
+        self._check(err, "hipModuleLaunchKernel")
 
 
 _hip: _Hip | None = None
@@ -1766,11 +1892,30 @@ def hip_kernels_available() -> bool:
     """Only for AMD's ROCm builds of PyTorch on Windows, where HIPRTC ships with torch."""
     if os.environ.get("SPANDREL_HIP_KERNELS", "").strip() == "0":
         return False
+    if not _platform_ok():
+        return False
+    # The kernels read raw pointers that tracing and dispatch modes cannot see:
+    # ONNX export, torch.jit, torch.compile and any TorchDispatchMode (e.g.
+    # FakeTensor) keep the original code (Rift73/spandrel 3e11fdd).
+    return not (
+        torch.jit.is_tracing()
+        or torch.onnx.is_in_onnx_export()
+        or torch.compiler.is_compiling()
+        or _dispatch_mode_count() > 0
+    )
+
+
+@functools.cache
+def _platform_ok() -> bool:
     return (
         sys.platform == "win32"
         and bool(torch.version.hip)
         and torch.cuda.is_available()
     )
+
+
+# The number of active TorchDispatchModes; PyTorch has no public API for it.
+_dispatch_mode_count = getattr(torch._C, "_len_torch_dispatch_stack", lambda: 0)
 
 
 def _get_hip() -> _Hip:
@@ -2133,7 +2278,7 @@ def spatial_gate(
     tokens = B * L
     stats = torch.empty((tokens, 2), device=x.device, dtype=torch.float32)
     hip.launch(
-        hip.get(device, "spatial_gate", f"sg_stats_{sfx}"),
+        hip.get(device, "spatial_gate", f"sg_stats{'_v' if vec else ''}_{sfx}"),
         ((tokens + 7) // 8, 1, 1),
         (256, 1, 1),
         [
@@ -2330,6 +2475,7 @@ def layer_norm(
     eps: float,
     residual: torch.Tensor | None = None,
     out_ld: int | None = None,
+    out_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
     """
     LayerNorm over the last dim of a contiguous tensor. With `residual`, first
@@ -2338,20 +2484,44 @@ def layer_norm(
 
     With `out_ld` (> C, <= 256), the LayerNorm is a [..., :C] view of a buffer
     with out_ld wide rows whose other columns are zero (see padded_linear).
+
+    `out_dtype` float16 with a float32 x (the FP32 trunk of an FP16 model, see
+    fp32_last_group): the sum stays float32, the residual and the LayerNorm
+    output are float16.
     """
     C = x.shape[-1]  # noqa: N806
     tokens = x.numel() // C
+    out_dtype = out_dtype or x.dtype
+    mixed = out_dtype != x.dtype
+    if mixed and not (
+        x.dtype == torch.float32
+        and out_dtype == torch.float16
+        and (residual is None or residual.dtype == torch.float16)
+    ):
+        raise ValueError(f"no LayerNorm kernel from {x.dtype} to {out_dtype}")
     ld = out_ld if out_ld is not None and C < out_ld <= 256 else C
-    full = torch.empty((*x.shape[:-1], ld), device=x.device, dtype=x.dtype)
+    full = torch.empty((*x.shape[:-1], ld), device=x.device, dtype=out_dtype)
     out = full if ld == C else full[..., :C]
     sum_out = torch.empty_like(x) if residual is not None else None
     if residual is not None:
         residual = residual.contiguous()
+    vec = (
+        _dwv
+        and not mixed
+        and C % 4 == 0
+        and ld % 4 == 0
+        and all(
+            t is None or t.data_ptr() % 16 == 0 for t in (x, residual, sum_out, full)
+        )
+    )
+    name = (
+        "add_ln_f32_f16"
+        if mixed
+        else f"add_ln{'_v' if vec else ''}_{_DTYPE_SUFFIX[x.dtype]}"
+    )
     hip = _get_hip()
     hip.launch(
-        hip.get(
-            x.device.index or 0, "spatial_gate", f"add_ln_{_DTYPE_SUFFIX[x.dtype]}"
-        ),
+        hip.get(x.device.index or 0, "spatial_gate", name),
         ((tokens + 7) // 8, 1, 1),
         (256, 1, 1),
         [

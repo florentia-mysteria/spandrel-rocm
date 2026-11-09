@@ -11,7 +11,7 @@
     scale=3,
     size_requirements=SizeRequirements(minimum=16, multiple_of=1, square=False),
     supports_bfloat16=True,
-    supports_half=False,
+    supports_half=True,
     tags=list([
       'medium',
       's64w16',
@@ -34,7 +34,7 @@
     scale=4,
     size_requirements=SizeRequirements(minimum=16, multiple_of=1, square=False),
     supports_bfloat16=True,
-    supports_half=False,
+    supports_half=True,
     tags=list([
       'medium',
       's64w16',
@@ -57,7 +57,7 @@
     scale=4,
     size_requirements=SizeRequirements(minimum=16, multiple_of=1, square=False),
     supports_bfloat16=True,
-    supports_half=False,
+    supports_half=True,
     tags=list([
       'large',
       's64w16',
@@ -80,7 +80,7 @@
     scale=2,
     size_requirements=SizeRequirements(minimum=16, multiple_of=1, square=False),
     supports_bfloat16=True,
-    supports_half=False,
+    supports_half=True,
     tags=list([
       'small',
       's64w16',
@@ -103,7 +103,7 @@
     scale=3,
     size_requirements=SizeRequirements(minimum=16, multiple_of=1, square=False),
     supports_bfloat16=True,
-    supports_half=False,
+    supports_half=True,
     tags=list([
       'small',
       's64w16',
@@ -126,7 +126,7 @@
     scale=4,
     size_requirements=SizeRequirements(minimum=16, multiple_of=1, square=False),
     supports_bfloat16=True,
-    supports_half=False,
+    supports_half=True,
     tags=list([
       'small',
       's64w16',
@@ -149,7 +149,7 @@
     scale=4,
     size_requirements=SizeRequirements(minimum=16, multiple_of=1, square=False),
     supports_bfloat16=True,
-    supports_half=False,
+    supports_half=True,
     tags=list([
       'medium',
       's64w16',
@@ -172,7 +172,7 @@
     scale=4,
     size_requirements=SizeRequirements(minimum=16, multiple_of=1, square=False),
     supports_bfloat16=True,
-    supports_half=False,
+    supports_half=True,
     tags=list([
       'small',
       's64w16',
