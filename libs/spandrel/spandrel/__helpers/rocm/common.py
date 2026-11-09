@@ -24,6 +24,9 @@ def clear_caches() -> None:
     """
     for clear in _cache_clearers:
         clear()
+    from .kernels import clear_caches as clear_kernel_caches
+
+    clear_kernel_caches()
 
 
 def version_of(t: torch.Tensor) -> int:

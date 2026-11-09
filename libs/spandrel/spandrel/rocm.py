@@ -1,7 +1,8 @@
 """
 ROCm acceleration controls.
 
-On AMD's ROCm builds of PyTorch for Windows, spandrel runs some operations with
+On AMD's ROCm builds of PyTorch for Windows and Linux, spandrel runs some
+operations with
 custom HIP kernels (compiled at runtime with HIPRTC, which ships with PyTorch).
 Elsewhere nothing changes.
 
@@ -9,7 +10,8 @@ Environment variables:
 - SPANDREL_HIP_KERNELS=0 disables all custom kernels.
 - SPANDREL_HIP_WMMA=0 disables the WMMA attention kernel on RDNA4 (gfx12).
 - SPANDREL_HIP_CACHE_DIR sets where compiled kernels are cached (empty: no
-  cache). Default: %LOCALAPPDATA%/spandrel/hip_cache.
+  cache). Default: %LOCALAPPDATA%/spandrel/hip_cache on Windows,
+  $XDG_CACHE_HOME/spandrel/hip_cache (~/.cache) on Linux.
 """
 
 from __future__ import annotations

@@ -614,6 +614,9 @@ class AttenBlocks(nn.Module):
             self.downsample = None
 
     def forward(self, x, x_size, params):
+        fast = _rocm.blocks_forward(self, x, x_size, params)
+        if fast is not None:
+            return fast
         for blk in self.blocks:
             x = blk(x, x_size, params["rpi_sa"], params["attn_mask"])
 
@@ -719,6 +722,9 @@ class RHAG(nn.Module):
         )
 
     def forward(self, x, x_size, params):
+        fast = _rocm.rhag_forward(self, x, x_size, params)
+        if fast is not None:
+            return fast
         return (
             self.patch_embed(
                 self.conv(
