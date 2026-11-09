@@ -452,6 +452,11 @@ extern "C" __global__ void dw_tokens_bf16(const bf16_t* x, bf16_t* out, DWT_ARGS
 #define DWV_CV 16
 #define DWV_TX 16
 #define DWV_TY 8
+// at most ~136 VGPRs: 10 waves per SIMD instead of 7 at the 193 the compiler
+// picks otherwise; the latency-bound row loop (ATT: ~45% waiting for loads,
+// ~25% at the barrier) gains more from the waves than it loses to a
+// small spill: spatial gate 0.42 -> 0.355 ms per 256px tile, dwconv same
+#define DWV_WAVES __attribute__((amdgpu_waves_per_eu(10)))
 __device__ __forceinline__ void load4(const float* p, long long i, float v[4]) {
     const float4 q = *(const float4*)(p + i);
     v[0] = q.x; v[1] = q.y; v[2] = q.z; v[3] = q.w;
@@ -653,17 +658,17 @@ __device__ void dw_tokens_v(const T* __restrict__ x, long long row_stride, int c
     }
 }
 
-extern "C" __global__ void __launch_bounds__(256) dw_tokens_v_f32(const float* x, float* out, DWT_ARGS, int C, int H, int W) { dw_tokens_v<float>(x, DWT_PASS, out, C, H, W); }
-extern "C" __global__ void __launch_bounds__(256) dw_tokens_v_f16(const _Float16* x, _Float16* out, DWT_ARGS, int C, int H, int W) { dw_tokens_v<_Float16>(x, DWT_PASS, out, C, H, W); }
-extern "C" __global__ void __launch_bounds__(256) dw_tokens_v_bf16(const bf16_t* x, bf16_t* out, DWT_ARGS, int C, int H, int W) { dw_tokens_v<bf16_t>(x, DWT_PASS, out, C, H, W); }
+extern "C" __global__ void __launch_bounds__(256) DWV_WAVES dw_tokens_v_f32(const float* x, float* out, DWT_ARGS, int C, int H, int W) { dw_tokens_v<float>(x, DWT_PASS, out, C, H, W); }
+extern "C" __global__ void __launch_bounds__(256) DWV_WAVES dw_tokens_v_f16(const _Float16* x, _Float16* out, DWT_ARGS, int C, int H, int W) { dw_tokens_v<_Float16>(x, DWT_PASS, out, C, H, W); }
+extern "C" __global__ void __launch_bounds__(256) DWV_WAVES dw_tokens_v_bf16(const bf16_t* x, bf16_t* out, DWT_ARGS, int C, int H, int W) { dw_tokens_v<bf16_t>(x, DWT_PASS, out, C, H, W); }
 #define SGV_ARGS const float* stats, const float* gamma, const float* beta, int gate_off, int out_ld
 #define SGV_PASS stats, gamma, beta, gate_off, out_ld
 extern "C" __global__ void sg_stats_v_f32(const float* x, int C, long long tokens, float eps, float* stats, int gelu_in) { sg_stats_v<float>(x, C, tokens, eps, stats, gelu_in); }
 extern "C" __global__ void sg_stats_v_f16(const _Float16* x, int C, long long tokens, float eps, float* stats, int gelu_in) { sg_stats_v<_Float16>(x, C, tokens, eps, stats, gelu_in); }
 extern "C" __global__ void sg_stats_v_bf16(const bf16_t* x, int C, long long tokens, float eps, float* stats, int gelu_in) { sg_stats_v<bf16_t>(x, C, tokens, eps, stats, gelu_in); }
-extern "C" __global__ void __launch_bounds__(256) sg_gate_v_f32(const float* x, float* out, DWT_ARGS, int C, int H, int W, SGV_ARGS) { dw_tokens_v<float>(x, DWT_PASS, out, C, H, W, SGV_PASS); }
-extern "C" __global__ void __launch_bounds__(256) sg_gate_v_f16(const _Float16* x, _Float16* out, DWT_ARGS, int C, int H, int W, SGV_ARGS) { dw_tokens_v<_Float16>(x, DWT_PASS, out, C, H, W, SGV_PASS); }
-extern "C" __global__ void __launch_bounds__(256) sg_gate_v_bf16(const bf16_t* x, bf16_t* out, DWT_ARGS, int C, int H, int W, SGV_ARGS) { dw_tokens_v<bf16_t>(x, DWT_PASS, out, C, H, W, SGV_PASS); }
+extern "C" __global__ void __launch_bounds__(256) DWV_WAVES sg_gate_v_f32(const float* x, float* out, DWT_ARGS, int C, int H, int W, SGV_ARGS) { dw_tokens_v<float>(x, DWT_PASS, out, C, H, W, SGV_PASS); }
+extern "C" __global__ void __launch_bounds__(256) DWV_WAVES sg_gate_v_f16(const _Float16* x, _Float16* out, DWT_ARGS, int C, int H, int W, SGV_ARGS) { dw_tokens_v<_Float16>(x, DWT_PASS, out, C, H, W, SGV_PASS); }
+extern "C" __global__ void __launch_bounds__(256) DWV_WAVES sg_gate_v_bf16(const bf16_t* x, bf16_t* out, DWT_ARGS, int C, int H, int W, SGV_ARGS) { dw_tokens_v<bf16_t>(x, DWT_PASS, out, C, H, W, SGV_PASS); }
 
 // Statistics of a transposed ("channel") attention over the tokens, from a
 // (B, N, 3C) qkv buffer with heads of d <= 32 channels: per head the Gram
