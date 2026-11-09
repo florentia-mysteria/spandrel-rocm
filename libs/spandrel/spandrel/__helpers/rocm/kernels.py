@@ -749,11 +749,13 @@ template <typename T, typename TA = T, typename TO = T>
 __device__ void add_ln(const T* __restrict__ x, const TA* __restrict__ a, T* __restrict__ sum_out,
                        TO* __restrict__ out, const float* __restrict__ gamma,
                        const float* __restrict__ beta, int C, long long tokens, float eps,
-                       int out_ld) {
+                       int out_ld, int a_ld) {
     const int lane = threadIdx.x & 31;
     const long long tok = (long long)blockIdx.x * 8 + (threadIdx.x >> 5);
     if (tok >= tokens) return;
     const long long row = tok * C;
+    // the residual's rows may be wider (a [..., :C] view of a padded GEMM output)
+    const long long arow = tok * (a_ld > 0 ? a_ld : C);
     float v[8];
     float s = 0.0f;
     #pragma unroll
@@ -762,7 +764,7 @@ __device__ void add_ln(const T* __restrict__ x, const TA* __restrict__ a, T* __r
         float t = 0.0f;
         if (c < C) {
             t = load_val(x, row + c);
-            if (a) t = round_t(t + load_val(a, row + c), x);
+            if (a) t = round_t(t + load_val(a, arow + c), x);
         }
         v[k] = t;
         s += t;
@@ -800,11 +802,13 @@ template <typename T>
 __device__ void add_ln_v(const T* __restrict__ x, const T* __restrict__ a, T* __restrict__ sum_out,
                          T* __restrict__ out, const float* __restrict__ gamma,
                          const float* __restrict__ beta, int C, long long tokens, float eps,
-                         int out_ld) {
+                         int out_ld, int a_ld) {
     const int lane = threadIdx.x & 31;
     const long long tok = (long long)blockIdx.x * 8 + (threadIdx.x >> 5);
     if (tok >= tokens) return;
     const long long row = tok * C;
+    // the residual's rows may be wider (a [..., :C] view of a padded GEMM output)
+    const long long arow = tok * (a_ld > 0 ? a_ld : C);
     float v[2][4];
     float s = 0.0f;
     #pragma unroll
@@ -814,7 +818,7 @@ __device__ void add_ln_v(const T* __restrict__ x, const T* __restrict__ a, T* __
             load4(x, row + c, v[k]);
             if (a) {
                 float r[4];
-                load4(a, row + c, r);
+                load4(a, arow + c, r);
                 #pragma unroll
                 for (int j = 0; j < 4; j++) v[k][j] = round_t(v[k][j] + r[j], x);
             }
@@ -933,13 +937,13 @@ __device__ void aim_ln(const T* __restrict__ x, const T* __restrict__ a, const T
 extern "C" __global__ void aim_ln_f32(const float* x, const float* a, const float* c, AIM_ARGS, float* sum_out, float* out, LN_ARGS, long long L) { aim_ln<float>(x, a, c, AIM_PASS, sum_out, out, gamma, beta, C, tokens, L, eps); }
 extern "C" __global__ void aim_ln_f16(const _Float16* x, const _Float16* a, const _Float16* c, AIM_ARGS, _Float16* sum_out, _Float16* out, LN_ARGS, long long L) { aim_ln<_Float16>(x, a, c, AIM_PASS, sum_out, out, gamma, beta, C, tokens, L, eps); }
 extern "C" __global__ void aim_ln_bf16(const bf16_t* x, const bf16_t* a, const bf16_t* c, AIM_ARGS, bf16_t* sum_out, bf16_t* out, LN_ARGS, long long L) { aim_ln<bf16_t>(x, a, c, AIM_PASS, sum_out, out, gamma, beta, C, tokens, L, eps); }
-extern "C" __global__ void add_ln_v_f32(const float* x, const float* a, float* sum_out, float* out, LN_ARGS, int out_ld) { add_ln_v<float>(x, a, sum_out, out, LN_PASS, out_ld); }
-extern "C" __global__ void add_ln_v_f16(const _Float16* x, const _Float16* a, _Float16* sum_out, _Float16* out, LN_ARGS, int out_ld) { add_ln_v<_Float16>(x, a, sum_out, out, LN_PASS, out_ld); }
-extern "C" __global__ void add_ln_v_bf16(const bf16_t* x, const bf16_t* a, bf16_t* sum_out, bf16_t* out, LN_ARGS, int out_ld) { add_ln_v<bf16_t>(x, a, sum_out, out, LN_PASS, out_ld); }
-extern "C" __global__ void add_ln_f32(const float* x, const float* a, float* sum_out, float* out, LN_ARGS, int out_ld) { add_ln<float>(x, a, sum_out, out, LN_PASS, out_ld); }
-extern "C" __global__ void add_ln_f16(const _Float16* x, const _Float16* a, _Float16* sum_out, _Float16* out, LN_ARGS, int out_ld) { add_ln<_Float16>(x, a, sum_out, out, LN_PASS, out_ld); }
-extern "C" __global__ void add_ln_bf16(const bf16_t* x, const bf16_t* a, bf16_t* sum_out, bf16_t* out, LN_ARGS, int out_ld) { add_ln<bf16_t>(x, a, sum_out, out, LN_PASS, out_ld); }
-extern "C" __global__ void add_ln_f32_f16(const float* x, const _Float16* a, float* sum_out, _Float16* out, LN_ARGS, int out_ld) { add_ln<float, _Float16, _Float16>(x, a, sum_out, out, LN_PASS, out_ld); }
+extern "C" __global__ void add_ln_v_f32(const float* x, const float* a, float* sum_out, float* out, LN_ARGS, int out_ld, int a_ld) { add_ln_v<float>(x, a, sum_out, out, LN_PASS, out_ld, a_ld); }
+extern "C" __global__ void add_ln_v_f16(const _Float16* x, const _Float16* a, _Float16* sum_out, _Float16* out, LN_ARGS, int out_ld, int a_ld) { add_ln_v<_Float16>(x, a, sum_out, out, LN_PASS, out_ld, a_ld); }
+extern "C" __global__ void add_ln_v_bf16(const bf16_t* x, const bf16_t* a, bf16_t* sum_out, bf16_t* out, LN_ARGS, int out_ld, int a_ld) { add_ln_v<bf16_t>(x, a, sum_out, out, LN_PASS, out_ld, a_ld); }
+extern "C" __global__ void add_ln_f32(const float* x, const float* a, float* sum_out, float* out, LN_ARGS, int out_ld, int a_ld) { add_ln<float>(x, a, sum_out, out, LN_PASS, out_ld, a_ld); }
+extern "C" __global__ void add_ln_f16(const _Float16* x, const _Float16* a, _Float16* sum_out, _Float16* out, LN_ARGS, int out_ld, int a_ld) { add_ln<_Float16>(x, a, sum_out, out, LN_PASS, out_ld, a_ld); }
+extern "C" __global__ void add_ln_bf16(const bf16_t* x, const bf16_t* a, bf16_t* sum_out, bf16_t* out, LN_ARGS, int out_ld, int a_ld) { add_ln<bf16_t>(x, a, sum_out, out, LN_PASS, out_ld, a_ld); }
+extern "C" __global__ void add_ln_f32_f16(const float* x, const _Float16* a, float* sum_out, _Float16* out, LN_ARGS, int out_ld, int a_ld) { add_ln<float, _Float16, _Float16>(x, a, sum_out, out, LN_PASS, out_ld, a_ld); }
 
 // HAT's HAB residual and second LayerNorm in one pass:
 //   sum = (x + a) + (conv * ca[b, c]) * scale     (each op rounded to T, as in
@@ -2733,13 +2737,20 @@ def layer_norm(
     full = torch.empty((*x.shape[:-1], ld), device=x.device, dtype=out_dtype)
     out = full if ld == C else full[..., :C]
     sum_out = torch.empty_like(x) if residual is not None else None
+    a_ld = C
     if residual is not None:
-        residual = residual.contiguous()
+        # a [..., :C] view of rows a_ld wide (padded_linear with pad_out) is
+        # read in place; anything else is made contiguous
+        if _row_view_ld(residual, C) is not None:
+            a_ld = _row_view_ld(residual, C)
+        else:
+            residual = residual.contiguous()
     vec = (
         _dwv
         and not mixed
         and C % 4 == 0
         and ld % 4 == 0
+        and a_ld % 4 == 0
         and all(
             t is None or t.data_ptr() % 16 == 0 for t in (x, residual, sum_out, full)
         )
@@ -2765,10 +2776,27 @@ def layer_norm(
             ctypes.c_int64(tokens),
             ctypes.c_float(eps),
             ctypes.c_int(ld),
+            ctypes.c_int(a_ld),
         ],
         _stream(x),
     )
     return sum_out, out
+
+
+def _row_view_ld(t: torch.Tensor, c: int) -> int | None:
+    """The row width of t if t is t_full[..., :c] of a contiguous t_full with
+    rows wider than c, else None (t contiguous or another layout)."""
+    if t.shape[-1] != c or t.stride(-1) != 1 or t.dim() < 2:
+        return None
+    ld = t.stride(-2)
+    if ld <= c:
+        return None
+    expect = ld
+    for size, stride in zip(reversed(t.shape[:-1]), reversed(t.stride()[:-1])):
+        if size != 1 and stride != expect:
+            return None
+        expect *= size
+    return ld
 
 
 def padded_width(k: int) -> int:
@@ -2779,28 +2807,50 @@ def padded_width(k: int) -> int:
     return -(-k // 32) * 32
 
 
-def padded_linear(lin: torch.nn.Linear, x: torch.Tensor) -> torch.Tensor:
+def padded_linear(
+    lin: torch.nn.Linear, x: torch.Tensor, pad_out: bool = False
+) -> torch.Tensor:
     """
     lin(x) for x = buf[..., :K] of a buffer with wider rows whose extra columns
     are zero (from layer_norm, gate_mix or spatial_gate with out_ld): the GEMM
     runs with K = the row width and the weight zero padded to it (cached).
-    Same result as lin(x), for any x.
+
+    With pad_out, the output width N is padded to padded_width(N) too (zero
+    weight rows and bias) and a [..., :N] view is returned: hipBLASLt runs DAT's
+    N = 180 GEMMs ~25% slower than N = 192 on gfx1201. layer_norm reads such a
+    view as its residual in place. Same values as lin(x), for any x.
     """
     K = x.shape[-1]  # noqa: N806
     ld = x.stride(-2) if x.dim() >= 2 else K
-    if ld == K or x.stride(-1) != 1:
+    k_pad = not (ld == K or x.stride(-1) != 1)
+    w, bias = lin.weight, lin.bias
+    N = w.shape[0]  # noqa: N806
+    n_full = padded_width(N) if pad_out else N
+    if not k_pad and n_full == N:
         return lin(x)
-    full = x.as_strided((*x.shape[:-1], ld), x.stride())
-    w = lin.weight
+    inp = x.as_strided((*x.shape[:-1], ld), x.stride()) if k_pad else x
+    kw = ld if k_pad else K
     # version_of: weights cast inside inference mode have no version counter
-    key = (w.data_ptr(), version_of(w), w.dtype, ld)
+    key = (
+        w.data_ptr(),
+        version_of(w),
+        w.dtype,
+        kw,
+        n_full,
+        None if bias is None else (bias.data_ptr(), version_of(bias)),
+    )
     cached = lin.__dict__.get("_spandrel_padded_w")
     if cached is None or cached[0] != key:
-        wp = torch.zeros((w.shape[0], ld), device=w.device, dtype=w.dtype)
-        wp[:, :K] = w.detach()
-        cached = (key, wp)
+        wp = torch.zeros((n_full, kw), device=w.device, dtype=w.dtype)
+        wp[:N, :K] = w.detach()
+        bp = bias
+        if bias is not None and n_full != N:
+            bp = torch.zeros((n_full,), device=bias.device, dtype=bias.dtype)
+            bp[:N] = bias.detach()
+        cached = (key, wp, bp)
         lin.__dict__["_spandrel_padded_w"] = cached
-    return torch.nn.functional.linear(full, cached[1], lin.bias)
+    out = torch.nn.functional.linear(inp, cached[1], cached[2])
+    return out if n_full == N else out[..., :N]
 
 
 def gated_mix_layer_norm(

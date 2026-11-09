@@ -548,7 +548,7 @@ def adaptive_spatial_attention(module: nn.Module, x, H, W):  # noqa: N803
             a_uses_tok=False,
             out_ld=_k_width(C),
         )
-        return module.proj_drop(kernels.padded_linear(module.proj, x))
+        return module.proj_drop(kernels.padded_linear(module.proj, x, pad_out=True))
     except Exception as e:  # noqa: BLE001
         _aim_failed = True
         logger.warning("HIP adaptive interaction failed, falling back: %s", e)
@@ -624,7 +624,7 @@ def adaptive_channel_attention(module: nn.Module, x, H, W):  # noqa: N803
             a_uses_tok=True,
             out_ld=_k_width(C),
         )
-        return module.proj_drop(kernels.padded_linear(module.proj, x))
+        return module.proj_drop(kernels.padded_linear(module.proj, x, pad_out=True))
     except Exception as e:  # noqa: BLE001
         _aim_failed = True
         logger.warning("HIP adaptive interaction failed, falling back: %s", e)
@@ -746,7 +746,7 @@ def dat_block(module: nn.Module, x, x_size):
                     gelu_in=True,
                     out_ld=_k_width(h.shape[-1] // 2),
                 )
-                return s + kernels.padded_linear(ffn.fc2, g)
+                return s + kernels.padded_linear(ffn.fc2, g, pad_out=True)
             return s + ffn.fc2(ffn.sg(ffn.act(h), H, W))
         return s + module.drop_path(module.ffn(n2, H, W))
     except Exception as e:  # noqa: BLE001
