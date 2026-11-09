@@ -12,6 +12,8 @@ from pathlib import Path
 
 import torch
 
+from .common import version_of
+
 logger = logging.getLogger("spandrel.rocm")
 
 # Custom HIP kernels for operations that MIOpen handles poorly on consumer
@@ -1157,6 +1159,7 @@ typedef short v8s __attribute__((ext_vector_type(8)));
 typedef _Float16 v8h __attribute__((ext_vector_type(8)));
 typedef float v8f __attribute__((ext_vector_type(8)));
 typedef float v4f __attribute__((ext_vector_type(4)));
+typedef int v4i __attribute__((ext_vector_type(4)));
 
 __device__ __forceinline__ u16 f2bf(float v) {
     unsigned int u = __float_as_uint(v);
@@ -1354,6 +1357,191 @@ __device__ void win_attn_wmma(const u16* __restrict__ qkv, long long s0, long lo
     }
 }
 
+#ifndef WMMAT_QT
+#define WMMAT_QT 2
+#endif
+
+// The same attention computed transposed: S^T = K Q^T and O^T = V^T P^T.
+// The D layout of S^T (lane -> query l%16, keys 8*(l/16)+i) is exactly the B
+// operand layout P^T needs, so P never leaves the registers, and each lane
+// owns one query: the softmax row max is a local max over 8 values plus one
+// shuffle with the other half wave, the row sum is local until the end, and
+// the O^T rescale is one scalar per lane. Two key tiles per softmax step.
+template <bool BF16, int KD, int QT>
+__device__ void win_attn_wmmat(const u16* __restrict__ qkv, long long s0, long long s1, long long s2, long long s3,
+                               const float* __restrict__ biasT, const int* __restrict__ labels,
+                               u16* __restrict__ out, long long out_stride, int out_off, int Hc, int Wc,
+                               int sy, int sx, int H, int W, int H_sp, int W_sp,
+                               int heads, int d, float scale) {
+    constexpr int KS = KD / 16;
+    extern __shared__ unsigned char lds_raw[];
+    const int N = H_sp * W_sp;
+    u16* Ks = (u16*)lds_raw;           // [N][KD]
+    u16* Vt = Ks + N * KD;             // [KD][N]
+    int* labs = (int*)(Vt + N * KD);   // [N]
+
+    const int nw = W / W_sp, nh = H / H_sp, nW = nh * nw;
+    const int h = blockIdx.x % heads;
+    const int win = blockIdx.x / heads;
+    const int b = win / nW, wimg = win % nW;
+    const int ih = wimg / nw, iw = wimg % nw;
+
+    // Stage K and V^T. With unit channel stride and even sizes, consecutive
+    // threads read consecutive 32-bit pairs of one token's channels, so the
+    // loads are coalesced; otherwise one thread per token as in win_attn_wmma.
+    const bool pairs = s3 == 1 && !(d & 1) && !(s0 & 1) && !(s1 & 1) && !(s2 & 1);
+    if (pairs) {
+        constexpr int KP = KD / 2;
+        for (int i = threadIdx.x; i < N * KP; i += 256) {
+            const int t = i / KP, j = 2 * (i % KP);
+            const int y = ih * H_sp + t / W_sp, x = iw * W_sp + t % W_sp;
+            const int ys = (y + sy) % H, xs = (x + sx) % W;
+            unsigned int kv = 0, vv = 0;
+            if (j < d && ys < Hc && xs < Wc) {
+                const long long base = (long long)b * s1 + ((long long)ys * Wc + xs) * s2 + h * d + j;
+                kv = *(const unsigned int*)(qkv + s0 + base);
+                vv = *(const unsigned int*)(qkv + 2 * s0 + base);
+            }
+            *(unsigned int*)(Ks + t * KD + j) = kv;
+            Vt[j * N + t] = (u16)(vv & 0xFFFFu);
+            Vt[(j + 1) * N + t] = (u16)(vv >> 16);
+        }
+    } else {
+        for (int t = threadIdx.x; t < N; t += 256) {
+            const int y = ih * H_sp + t / W_sp, x = iw * W_sp + t % W_sp;
+            const int ys = (y + sy) % H, xs = (x + sx) % W;
+            const bool valid = ys < Hc && xs < Wc;
+            const long long base = (long long)b * s1 + ((long long)ys * Wc + xs) * s2 + (long long)(h * d) * s3;
+            for (int j = 0; j < KD; j++) {
+                const bool in = j < d && valid;
+                Ks[t * KD + j] = in ? qkv[s0 + base + j * s3] : (u16)0;
+                Vt[j * N + t] = in ? qkv[2 * s0 + base + j * s3] : (u16)0;
+            }
+        }
+    }
+    if (labels)
+        for (int t = threadIdx.x; t < N; t += 256) labs[t] = labels[wimg * N + t];
+    __syncthreads();
+
+    const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int col = lane & 15, half = lane >> 4;
+    const int nkt = N / 16;
+
+    // QT query tiles per wave at once: they share every K/V^T operand load
+    // and give the scheduler independent WMMA/exp chains to interleave.
+    for (int qt0 = wave * QT; qt0 < nkt; qt0 += 8 * QT) {
+        const int nq = min(QT, nkt - qt0);
+        int qn[QT], qlab[QT];
+        const float* bq[QT];
+        v8s qb[QT][KS];
+        float m[QT], lsum[QT];
+        v8f o[QT][KS];
+        #pragma unroll
+        for (int r = 0; r < QT; r++) {
+            qn[r] = (qt0 + (r < nq ? r : 0)) * 16 + col;
+            const int y = ih * H_sp + qn[r] / W_sp, x = iw * W_sp + qn[r] % W_sp;
+            const int ys = (y + sy) % H, xs = (x + sx) % W;
+            const bool valid = ys < Hc && xs < Wc;
+            if (pairs) {
+                const unsigned int* qp = (const unsigned int*)(
+                    qkv + (long long)b * s1 + ((long long)ys * Wc + xs) * s2 + h * d);
+                #pragma unroll
+                for (int s = 0; s < KS; s++)
+                    #pragma unroll
+                    for (int i = 0; i < 4; i++) {
+                        const int j = s * 16 + 8 * half + 2 * i;
+                        const unsigned int u = (j < d && valid) ? qp[j / 2] : 0u;
+                        qb[r][s][2 * i] = (short)(u & 0xFFFFu);
+                        qb[r][s][2 * i + 1] = (short)(u >> 16);
+                    }
+            } else {
+                const long long base = (long long)b * s1 + ((long long)ys * Wc + xs) * s2 + (long long)(h * d) * s3;
+                #pragma unroll
+                for (int s = 0; s < KS; s++)
+                    #pragma unroll
+                    for (int i = 0; i < 8; i++) {
+                        const int j = s * 16 + 8 * half + i;
+                        qb[r][s][i] = (j < d && valid) ? (short)qkv[base + j * s3] : (short)0;
+                    }
+            }
+            qlab[r] = labels ? labs[qn[r]] : 0;
+            // biasQ is (heads, query, key): this lane's 8 keys are contiguous
+            bq[r] = biasT ? biasT + ((long long)h * N + qn[r]) * N : nullptr;
+            m[r] = -__builtin_inff(); lsum[r] = 0.0f;
+            #pragma unroll
+            for (int t = 0; t < KS; t++) o[r][t] = (v8f){0, 0, 0, 0, 0, 0, 0, 0};
+        }
+
+        for (int kt = 0; kt < nkt; kt++) {
+            v8s ka[KS], va[KS];
+            #pragma unroll
+            for (int s = 0; s < KS; s++)
+                ka[s] = *(const v8s*)(Ks + (kt * 16 + col) * KD + s * 16 + 8 * half);
+            #pragma unroll
+            for (int t = 0; t < KS; t++)
+                va[t] = *(const v8s*)(Vt + (t * 16 + col) * N + kt * 16 + 8 * half);
+            const int k0 = kt * 16 + 8 * half;
+            v4i l0 = {0, 0, 0, 0}, l1 = {0, 0, 0, 0};
+            if (labels) { l0 = *(const v4i*)(labs + k0); l1 = *(const v4i*)(labs + k0 + 4); }
+            #pragma unroll
+            for (int r = 0; r < QT; r++) {
+                v8f sacc = (v8f){0, 0, 0, 0, 0, 0, 0, 0};
+                #pragma unroll
+                for (int s = 0; s < KS; s++) sacc = mma<BF16>(ka[s], qb[r][s], sacc);
+                v4f b0 = {0, 0, 0, 0}, b1 = {0, 0, 0, 0};
+                if (bq[r]) { b0 = *(const v4f*)(bq[r] + k0); b1 = *(const v4f*)(bq[r] + k0 + 4); }
+                float sv[8];
+                float mx = -__builtin_inff();
+                #pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    float v = sacc[i] * scale + (i < 4 ? b0[i] : b1[i - 4]);
+                    if (labels && (i < 4 ? l0[i] : l1[i - 4]) != qlab[r]) v -= 100.0f;
+                    sv[i] = v;
+                    mx = fmaxf(mx, v);
+                }
+                mx = fmaxf(mx, __shfl_xor(mx, 16, 32));
+                const float mn = fmaxf(m[r], mx);
+                const float corr = __expf(m[r] - mn);
+                m[r] = mn;
+                v8s pb;
+                float ps = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    const float p = __expf(sv[i] - mn);
+                    ps += p;
+                    pb[i] = (short)(BF16 ? f2bf(p) : f2h(p));
+                }
+                lsum[r] = lsum[r] * corr + ps;
+                #pragma unroll
+                for (int t = 0; t < KS; t++) {
+                    #pragma unroll
+                    for (int i = 0; i < 8; i++) o[r][t][i] *= corr;
+                    o[r][t] = mma<BF16>(va[t], pb, o[r][t]);
+                }
+            }
+        }
+
+        #pragma unroll
+        for (int r = 0; r < QT; r++) {
+            if (r >= nq) break;
+            const float ls = lsum[r] + __shfl_xor(lsum[r], 16, 32);
+            const int y = ih * H_sp + qn[r] / W_sp, x = iw * W_sp + qn[r] % W_sp;
+            const int ys = (y + sy) % H, xs = (x + sx) % W;
+            if (ys < Hc && xs < Wc) {
+                const float inv = 1.0f / ls;
+                const long long ob = (((long long)b * Hc + ys) * Wc + xs) * out_stride + out_off + h * d;
+                #pragma unroll
+                for (int t = 0; t < KS; t++)
+                    #pragma unroll
+                    for (int i = 0; i < 8; i++) {
+                        const int j = t * 16 + 8 * half + i;
+                        if (j < d) out[ob + j] = BF16 ? f2bf(o[r][t][i] * inv) : f2h(o[r][t][i] * inv);
+                    }
+            }
+        }
+    }
+}
+
 #define WMMA_ARGS long long s0, long long s1, long long s2, long long s3, const float* biasT, const int* labels, long long out_stride, int out_off, int Hc, int Wc, int sy, int sx, int H, int W, int H_sp, int W_sp, int heads, int d, float scale
 #define WMMA_PASS s0, s1, s2, s3, biasT, labels, out, out_stride, out_off, Hc, Wc, sy, sx, H, W, H_sp, W_sp, heads, d, scale
 extern "C" __global__ void __launch_bounds__(256) win_attn_wmma_bf16_32(const u16* qkv, u16* out, WMMA_ARGS) { win_attn_wmma<true, 32>(qkv, WMMA_PASS); }
@@ -1362,6 +1550,9 @@ extern "C" __global__ void __launch_bounds__(256) win_attn_wmma_bf16_16(const u1
 extern "C" __global__ void __launch_bounds__(256) win_attn_wmma_f16_32(const u16* qkv, u16* out, WMMA_ARGS) { win_attn_wmma<false, 32>(qkv, WMMA_PASS); }
 extern "C" __global__ void __launch_bounds__(256) win_attn_wmma_f16_64(const u16* qkv, u16* out, WMMA_ARGS) { win_attn_wmma<false, 64>(qkv, WMMA_PASS); }
 extern "C" __global__ void __launch_bounds__(256) win_attn_wmma_f16_16(const u16* qkv, u16* out, WMMA_ARGS) { win_attn_wmma<false, 16>(qkv, WMMA_PASS); }
+#define WMMAT(S, B, KD) extern "C" __global__ void __launch_bounds__(256) win_attn_wmmat_##S##_##KD(const u16* qkv, u16* out, WMMA_ARGS) { win_attn_wmmat<B, KD, WMMAT_QT>(qkv, WMMA_PASS); }
+WMMAT(bf16, true, 16) WMMAT(bf16, true, 32) WMMAT(bf16, true, 64)
+WMMAT(f16, false, 16) WMMAT(f16, false, 32) WMMAT(f16, false, 64)
 """
 
 # HAT OCAB: the helpers of _ATTN_WMMA_SRC (up to win_attn_wmma) + its own kernel
@@ -1657,7 +1848,12 @@ _PROGRAMS: dict[str, tuple[str, list[str], list[str]]] = {
     # gfx12 (RDNA4) only: uses the gfx12 WMMA builtins
     "win_attn_wmma": (
         _ATTN_WMMA_SRC,
-        [f"win_attn_wmma_{s}_{kd}" for s in ("bf16", "f16") for kd in (16, 32, 64)],
+        [
+            f"win_attn_{v}_{s}_{kd}"
+            for v in ("wmma", "wmmat")
+            for s in ("bf16", "f16")
+            for kd in (16, 32, 64)
+        ],
         ["-std=c++17"],
     ),
     # gfx12 (RDNA4) only, like win_attn_wmma
@@ -2018,6 +2214,28 @@ def _wmma_lds_bytes(n: int, kd: int) -> int:
     return n * kd * 2 + kd * (n + 8) * 2 + 8 * 512 * 2 + n * 4
 
 
+def _wmmat_lds_bytes(n: int, kd: int) -> int:
+    # must match win_attn_wmmat: K [N][KD], V^T [KD][N], labels
+    return 2 * n * kd * 2 + n * 4
+
+
+_bias_q_cache: dict[tuple[int, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _bias_query_major(bias_t: torch.Tensor) -> torch.Tensor:
+    """(heads, key, query) -> contiguous (heads, query, key) for win_attn_wmmat,
+    cached per tensor and version. From the linux-hip-hat branch."""
+    # version_of: inference tensors (DAT's cached bias) have no version counter
+    key = (bias_t.data_ptr(), version_of(bias_t), bias_t.shape[-1])
+    hit = _bias_q_cache.get(key)
+    if hit is None or hit[0] is not bias_t:
+        if len(_bias_q_cache) >= 64:
+            _bias_q_cache.pop(next(iter(_bias_q_cache)))
+        hit = (bias_t, bias_t.transpose(1, 2).contiguous())
+        _bias_q_cache[key] = hit
+    return hit[1]
+
+
 def _wmma_kd(qkv: torch.Tensor, d: int) -> int:
     """The head dim padded for WMMA (16/32/64), or 0 if WMMA does not apply."""
     if _wmma_failed or os.environ.get("SPANDREL_HIP_WMMA", "").strip() == "0":
@@ -2174,12 +2392,20 @@ def window_attention(
     device = qkv.device.index or 0
     kd = _wmma_head_dim(qkv, n, d)
     fn: ctypes.c_void_p | None = None
+    variant = ""
     if kd:
         try:
+            # the transposed kernel is faster up to 32 channels per head
+            # (DAT2 fp16 tile 256: 16.7 -> 12.6 ms per pass, measured on Linux)
+            variant = (
+                "wmma"
+                if kd > 32 or os.environ.get("SPANDREL_HIP_WMMA_T", "").strip() == "0"
+                else "wmmat"
+            )
             fn = hip.get(
                 device,
                 "win_attn_wmma",
-                f"win_attn_wmma_{_DTYPE_SUFFIX[qkv.dtype]}_{kd}",
+                f"win_attn_{variant}_{_DTYPE_SUFFIX[qkv.dtype]}_{kd}",
             )
         except Exception as e:  # noqa: BLE001
             # keep the scalar kernel, only the matrix core path is lost
@@ -2191,6 +2417,10 @@ def window_attention(
             kd = 0
     if fn is not None:
         block, shared = 256, _wmma_lds_bytes(n, kd)
+        if variant == "wmmat":
+            shared = _wmmat_lds_bytes(n, kd)
+            if bias_t is not None:
+                bias_t = _bias_query_major(bias_t)
     else:
         name = f"win_attn_{_DTYPE_SUFFIX[qkv.dtype]}_{32 if d <= 32 else 64}"
         fn = hip.get(device, "win_attn", name)
@@ -2562,7 +2792,8 @@ def padded_linear(lin: torch.nn.Linear, x: torch.Tensor) -> torch.Tensor:
         return lin(x)
     full = x.as_strided((*x.shape[:-1], ld), x.stride())
     w = lin.weight
-    key = (w.data_ptr(), w._version, w.dtype, ld)  # noqa: SLF001
+    # version_of: weights cast inside inference mode have no version counter
+    key = (w.data_ptr(), version_of(w), w.dtype, ld)
     cached = lin.__dict__.get("_spandrel_padded_w")
     if cached is None or cached[0] != key:
         wp = torch.zeros((w.shape[0], ld), device=w.device, dtype=w.dtype)
