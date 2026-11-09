@@ -339,6 +339,10 @@ def _aim_params(module: nn.Module, dtype: torch.dtype):
         b1.to(dtype),
         w2.to(dtype),
         b2.to(dtype) if b2 is not None else None,
+        # for kernels.spatial_map: w2 in float32, b2 as a Python float (read
+        # once here, not a device sync per call)
+        w2.reshape(-1).contiguous(),
+        float(b2) if b2 is not None else 0.0,
     )
     module.__dict__["_spandrel_aim_params"] = (key, params)
     return params
@@ -356,7 +360,10 @@ def _channel_map(module: nn.Module, t: torch.Tensor) -> torch.Tensor:
 
 def _spatial_map(t: torch.Tensor, params) -> torch.Tensor:
     """spatial_interaction(t as an image) as (B, L, 1), from the token layout."""
-    _, _, w1, b1, w2, b2 = params
+    w1, b1, w2, b2 = params[2:6]
+    w2f, b2f = params[6:8]
+    if kernels.can_spatial_map(t, w1.shape[0]):
+        return kernels.spatial_map(t, w1, b1, w2f, b2f)
     return F.linear(F.gelu(F.linear(t, w1, b1)), w2, b2)
 
 

@@ -663,6 +663,26 @@ extern "C" __global__ void __launch_bounds__(256) DWV_WAVES dw_tokens_v_f16(cons
 extern "C" __global__ void __launch_bounds__(256) DWV_WAVES dw_tokens_v_bf16(const bf16_t* x, bf16_t* out, DWT_ARGS, int C, int H, int W) { dw_tokens_v<bf16_t>(x, DWT_PASS, out, C, H, W); }
 #define SGV_ARGS const float* stats, const float* gamma, const float* beta, int gate_off, int out_ld
 #define SGV_PASS stats, gamma, beta, gate_off, out_ld
+// The end of DAT's spatial interaction: out[tok] = w2 . GELU(h[tok]) + b2 for the
+// (tokens, J) output h of its first 1x1 conv (a GEMM with N = J). PyTorch's
+// GEMM with N = 1 for this took 0.12 ms per 256px tile, this ~0.01 ms.
+template <typename T>
+__device__ void spatial_map(const T* __restrict__ h, long long ld, int J,
+                            const float* __restrict__ w2, float b2, T* __restrict__ out,
+                            long long tokens) {
+    const long long tok = (long long)blockIdx.x * 256 + threadIdx.x;
+    if (tok >= tokens) return;
+    const T* row = h + tok * ld;
+    float r = b2;
+    for (int j = 0; j < J; j++) {
+        const float a = load_val(row, j);
+        r += w2[j] * (0.5f * a * (1.0f + fast_erff(a * 0.70710678118654752f)));
+    }
+    store_val(out, tok, r);
+}
+extern "C" __global__ void spatial_map_f32(const float* h, long long ld, int J, const float* w2, float b2, float* out, long long tokens) { spatial_map<float>(h, ld, J, w2, b2, out, tokens); }
+extern "C" __global__ void spatial_map_f16(const _Float16* h, long long ld, int J, const float* w2, float b2, _Float16* out, long long tokens) { spatial_map<_Float16>(h, ld, J, w2, b2, out, tokens); }
+extern "C" __global__ void spatial_map_bf16(const bf16_t* h, long long ld, int J, const float* w2, float b2, bf16_t* out, long long tokens) { spatial_map<bf16_t>(h, ld, J, w2, b2, out, tokens); }
 extern "C" __global__ void sg_stats_v_f32(const float* x, int C, long long tokens, float eps, float* stats, int gelu_in) { sg_stats_v<float>(x, C, tokens, eps, stats, gelu_in); }
 extern "C" __global__ void sg_stats_v_f16(const _Float16* x, int C, long long tokens, float eps, float* stats, int gelu_in) { sg_stats_v<_Float16>(x, C, tokens, eps, stats, gelu_in); }
 extern "C" __global__ void sg_stats_v_bf16(const bf16_t* x, int C, long long tokens, float eps, float* stats, int gelu_in) { sg_stats_v<bf16_t>(x, C, tokens, eps, stats, gelu_in); }
@@ -1968,6 +1988,7 @@ _PROGRAMS: dict[str, tuple[str, list[str], list[str]]] = {
         + [f"dw_tokens_v_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"sg_gate_v_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"sg_stats_v_{s}" for s in _DTYPE_SUFFIX.values()]
+        + [f"spatial_map_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"chan_gram_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"add_ln_{s}" for s in _DTYPE_SUFFIX.values()]
         + ["add_ln_f32_f16"]
@@ -3323,5 +3344,47 @@ def image_add_tokens(res: torch.Tensor, img: torch.Tensor) -> torch.Tensor | Non
             ctypes.c_int64(L),
         ],
         _stream(res),
+    )
+    return out
+
+
+
+def can_spatial_map(t: torch.Tensor, hidden: int) -> bool:
+    return t.is_cuda and t.dtype in _DTYPE_SUFFIX and t.dim() == 3 and hidden <= 64
+
+
+def spatial_map(
+    t: torch.Tensor,
+    w1: torch.Tensor,
+    b1: torch.Tensor,
+    w2: torch.Tensor,
+    b2: float,
+) -> torch.Tensor:
+    """
+    w2 . GELU(t @ w1^T + b1) + b2 per token of t (B, L, C), as (B, L, 1) in t's
+    dtype. The first product is a GEMM (w1: (J, C), b1: (J,), in t's dtype);
+    GELU and the product with w2 ((J,) float32) are one kernel, summed in
+    float32.
+    """
+    h = torch.nn.functional.linear(t, w1, b1).contiguous()  # B, L, J
+    B, L, J = h.shape  # noqa: N806
+    tokens = B * L
+    out = torch.empty((B, L, 1), device=t.device, dtype=t.dtype)
+    hip = _get_hip()
+    name = f"spatial_map_{_DTYPE_SUFFIX[t.dtype]}"
+    hip.launch(
+        hip.get(t.device.index or 0, "spatial_gate", name),
+        ((tokens + 255) // 256, 1, 1),
+        (256, 1, 1),
+        [
+            ctypes.c_void_p(h.data_ptr()),
+            ctypes.c_int64(J),  # row stride of h
+            ctypes.c_int(J),
+            ctypes.c_void_p(w2.data_ptr()),
+            ctypes.c_float(b2),
+            ctypes.c_void_p(out.data_ptr()),
+            ctypes.c_int64(tokens),
+        ],
+        _stream(t),
     )
     return out
