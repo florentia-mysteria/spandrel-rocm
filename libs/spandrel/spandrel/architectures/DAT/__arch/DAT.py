@@ -865,6 +865,9 @@ class ResidualGroup(nn.Module):
                 x = checkpoint.checkpoint(blk, x, x_size)
             else:
                 x = blk(x, x_size)
+        fast = _rocm.residual_group_tail(self, x, res, x_size)
+        if fast is not None:
+            return fast
         x = rearrange(x, "b (h w) c -> b c h w", h=H, w=W)
         x = self.conv(x)
         x = rearrange(x, "b c h w -> b (h w) c")
@@ -1073,6 +1076,9 @@ class DAT(nn.Module):
         for layer in self.layers:
             x = layer(x, x_size)
         x = self.norm(x)
+        fast = _rocm.tokens_as_image(self, x, H, W)
+        if fast is not None:
+            return fast
         x = rearrange(x, "b (h w) c -> b c h w", h=H, w=W)
 
         return x

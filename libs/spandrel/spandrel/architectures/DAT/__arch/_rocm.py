@@ -753,3 +753,66 @@ def dat_block(module: nn.Module, x, x_size):
         _ln_failed = True
         logger.warning("HIP LayerNorm kernel failed, falling back: %s", e)
         return None
+
+
+# --- residual group tail and the body's image ------------------------------------
+
+_layout_failed = False
+
+
+def _conv_input_dtype(conv: nn.Module) -> torch.dtype:
+    """The dtype conv computes in: FP32 for fp32_last_group's FP32Conv2d."""
+    w = conv.weight.dtype
+    if type(conv).__name__ == "FP32Conv2d" and w == torch.float16:
+        return torch.float32
+    return w
+
+
+def _layout_usable(module: nn.Module, x: torch.Tensor) -> bool:
+    return (
+        not _layout_failed
+        and not module.training
+        and x.is_cuda
+        and not x.requires_grad
+        and kernels.hip_kernels_available()
+    )
+
+
+def residual_group_tail(module: nn.Module, x, res, x_size):
+    """
+    ResidualGroup's res + conv(x) with x as a (B, C, H, W) image, or None. The
+    token rows are transposed (and cast to the conv's dtype) by a tiled HIP
+    kernel instead of PyTorch's strided copy, and the result goes back to rows
+    with the residual add in the same pass.
+    """
+    global _layout_failed
+    conv = module.conv
+    if not isinstance(conv, nn.Conv2d) or not _layout_usable(module, x):
+        return None
+    H, W = x_size  # noqa: N806
+    try:
+        img = kernels.tokens_to_image(x.contiguous(), H, W, _conv_input_dtype(conv))
+        if img is None:
+            return None
+        y = conv(img)
+        out = kernels.image_add_tokens(res.contiguous(), y.contiguous())
+        if out is None:
+            out = res + y.flatten(2).transpose(1, 2)
+        return out
+    except Exception as e:  # noqa: BLE001
+        _layout_failed = True
+        logger.warning("HIP layout kernels failed, falling back: %s", e)
+        return None
+
+
+def tokens_as_image(module: nn.Module, x, H, W):  # noqa: N803
+    """rearrange(x, "b (h w) c -> b c h w") as a contiguous image, or None."""
+    global _layout_failed
+    if not _layout_usable(module, x):
+        return None
+    try:
+        return kernels.tokens_to_image(x.contiguous(), H, W)
+    except Exception as e:  # noqa: BLE001
+        _layout_failed = True
+        logger.warning("HIP layout kernels failed, falling back: %s", e)
+        return None

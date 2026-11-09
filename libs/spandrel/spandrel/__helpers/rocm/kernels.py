@@ -1841,9 +1841,99 @@ RRDB_KERNELS(bf16_t, bf16)
 _TW, _TH = 32, 16
 _MAX_GRID_Z = 65535
 _DTYPE_SUFFIX = {torch.float32: "f32", torch.float16: "f16", torch.bfloat16: "bf16"}
+# Layout changes between DAT's token rows (B, L, C) and the (B, C, H, W) images of
+# its residual-group convolutions, through 32x32 tiles in shared memory. PyTorch
+# runs `.contiguous()` of such a transposed view with its strided copy kernel at
+# ~50 GB/s (0.9 ms per 256px tile at C = 180, 1.3 ms with an FP16 -> FP32 cast,
+# measured with rocprofv3 on gfx1201); the way back fuses the residual add.
+_LAYOUT_SRC = r"""
+typedef unsigned short bf16_t;
+
+__device__ __forceinline__ float load_val(const float* p, long long i) { return p[i]; }
+__device__ __forceinline__ float load_val(const _Float16* p, long long i) { return (float)p[i]; }
+__device__ __forceinline__ float load_val(const bf16_t* p, long long i) {
+    return __uint_as_float(((unsigned int)p[i]) << 16);
+}
+__device__ __forceinline__ void store_val(float* p, long long i, float v) { p[i] = v; }
+__device__ __forceinline__ void store_val(_Float16* p, long long i, float v) { p[i] = (_Float16)v; }
+__device__ __forceinline__ void store_val(bf16_t* p, long long i, float v) {
+    unsigned int u = __float_as_uint(v);
+    u += 0x7FFFu + ((u >> 16) & 1u);
+    p[i] = v != v ? (bf16_t)0x7FC0 : (bf16_t)(u >> 16);
+}
+
+// (B, L, C) tokens -> (B, C, L) image, cast to TO. Block 32x8, grid (C/32, L/32, B).
+template <typename TI, typename TO>
+__device__ void tok2img(const TI* __restrict__ x, TO* __restrict__ y, int C, long long L) {
+    __shared__ float tile[32][33];
+    const int c0 = blockIdx.x * 32, tx = threadIdx.x, ty = threadIdx.y;
+    const long long l0 = (long long)blockIdx.y * 32;
+    const long long b = blockIdx.z;
+    #pragma unroll
+    for (int k = 0; k < 32; k += 8) {
+        const long long l = l0 + ty + k;
+        const int c = c0 + tx;
+        tile[ty + k][tx] = (l < L && c < C) ? load_val(x, (b * L + l) * C + c) : 0.0f;
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int k = 0; k < 32; k += 8) {
+        const int c = c0 + ty + k;
+        const long long l = l0 + tx;
+        if (c < C && l < L) store_val(y, (b * C + c) * L + l, tile[tx][ty + k]);
+    }
+}
+
+// out (B, L, C) = res (B, L, C) + img (B, C, L), the sum in float rounded to TO.
+template <typename TR, typename TI, typename TO>
+__device__ void img2tok_add(const TR* __restrict__ res, const TI* __restrict__ img,
+                            TO* __restrict__ out, int C, long long L) {
+    __shared__ float tile[32][33];
+    const int c0 = blockIdx.x * 32, tx = threadIdx.x, ty = threadIdx.y;
+    const long long l0 = (long long)blockIdx.y * 32;
+    const long long b = blockIdx.z;
+    #pragma unroll
+    for (int k = 0; k < 32; k += 8) {
+        const int c = c0 + ty + k;
+        const long long l = l0 + tx;
+        tile[ty + k][tx] = (c < C && l < L) ? load_val(img, (b * C + c) * L + l) : 0.0f;
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int k = 0; k < 32; k += 8) {
+        const long long l = l0 + ty + k;
+        const int c = c0 + tx;
+        if (l < L && c < C) {
+            const long long i = (b * L + l) * C + c;
+            store_val(out, i, load_val(res, i) + tile[tx][ty + k]);
+        }
+    }
+}
+
+#define T2I(NI, TI, NO, TO) extern "C" __global__ void __launch_bounds__(256) tok2img_##NI##_##NO(const TI* x, TO* y, int C, long long L) { tok2img<TI, TO>(x, y, C, L); }
+#define I2T(NR, TR, NI, TI, NO, TO) extern "C" __global__ void __launch_bounds__(256) img2tok_add_##NR##_##NI##_##NO(const TR* r, const TI* x, TO* y, int C, long long L) { img2tok_add<TR, TI, TO>(r, x, y, C, L); }
+T2I(f32, float, f32, float) T2I(f16, _Float16, f16, _Float16) T2I(bf16, bf16_t, bf16, bf16_t) T2I(f16, _Float16, f32, float)
+I2T(f32, float, f32, float, f32, float) I2T(f16, _Float16, f16, _Float16, f16, _Float16)
+I2T(bf16, bf16_t, bf16, bf16_t, bf16, bf16_t) I2T(f16, _Float16, f32, float, f32, float)
+"""
+
+_LAYOUT_T2I = [("f32", "f32"), ("f16", "f16"), ("bf16", "bf16"), ("f16", "f32")]
+_LAYOUT_I2T = [
+    ("f32", "f32", "f32"),
+    ("f16", "f16", "f16"),
+    ("bf16", "bf16", "bf16"),
+    ("f16", "f32", "f32"),
+]
+
 # name -> (source, kernel names, extra compiler options)
 _PROGRAMS: dict[str, tuple[str, list[str], list[str]]] = {
     "dwconv": (_DWCONV_SRC, [f"dwconv3x3_{s}" for s in _DTYPE_SUFFIX.values()], []),
+    "layout": (
+        _LAYOUT_SRC,
+        [f"tok2img_{i}_{o}" for i, o in _LAYOUT_T2I]
+        + [f"img2tok_add_{r}_{i}_{o}" for r, i, o in _LAYOUT_I2T],
+        [],
+    ),
     "win_attn": (
         _ATTN_SRC,
         [f"win_attn_{s}_{dm}" for s in _DTYPE_SUFFIX.values() for dm in (32, 64)],
@@ -3158,3 +3248,75 @@ def residual_add(
         ],
         _stream(a),
     )
+
+
+# --- token rows <-> images ----------------------------------------------------
+
+
+def tokens_to_image(
+    x: torch.Tensor,
+    H: int,  # noqa: N803
+    W: int,  # noqa: N803
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor | None:
+    """
+    rearrange(x, "b (h w) c -> b c h w").contiguous().to(dtype) for contiguous
+    token rows x (B, H*W, C), or None if no kernel covers the dtypes.
+    """
+    dtype = dtype or x.dtype
+    if not x.is_cuda or not x.is_contiguous() or x.dim() != 3 or x.shape[1] != H * W:
+        return None
+    key = (_DTYPE_SUFFIX.get(x.dtype), _DTYPE_SUFFIX.get(dtype))
+    if key not in _LAYOUT_T2I:
+        return None
+    B, L, C = x.shape  # noqa: N806
+    y = torch.empty((B, C, H, W), device=x.device, dtype=dtype)
+    hip = _get_hip()
+    hip.launch(
+        hip.get(x.device.index or 0, "layout", f"tok2img_{key[0]}_{key[1]}"),
+        (-(-C // 32), -(-L // 32), B),
+        (32, 8, 1),
+        [
+            ctypes.c_void_p(x.data_ptr()),
+            ctypes.c_void_p(y.data_ptr()),
+            ctypes.c_int(C),
+            ctypes.c_int64(L),
+        ],
+        _stream(x),
+    )
+    return y
+
+
+def image_add_tokens(res: torch.Tensor, img: torch.Tensor) -> torch.Tensor | None:
+    """
+    res + rearrange(img, "b c h w -> b (h w) c") as contiguous (B, H*W, C) rows,
+    in PyTorch's promoted dtype, for contiguous res (B, L, C) and img
+    (B, C, H, W); None if no kernel covers the dtypes.
+    """
+    if not (res.is_cuda and res.is_contiguous() and img.is_contiguous()):
+        return None
+    if res.dim() != 3 or img.dim() != 4:
+        return None
+    B, L, C = res.shape  # noqa: N806
+    if img.shape[0] != B or img.shape[1] != C or img.shape[2] * img.shape[3] != L:
+        return None
+    out_dtype = torch.promote_types(res.dtype, img.dtype)
+    key = tuple(_DTYPE_SUFFIX.get(t) for t in (res.dtype, img.dtype, out_dtype))
+    if key not in _LAYOUT_I2T:
+        return None
+    out = torch.empty((B, L, C), device=res.device, dtype=out_dtype)
+    hip = _get_hip()
+    hip.launch(
+        hip.get(res.device.index or 0, "layout", "img2tok_add_{}_{}_{}".format(*key)),
+        (-(-C // 32), -(-L // 32), B),
+        (32, 8, 1),
+        [
+            ctypes.c_void_p(res.data_ptr()),
+            ctypes.c_void_p(img.data_ptr()),
+            ctypes.c_void_p(out.data_ptr()),
+            ctypes.c_int(C),
+            ctypes.c_int64(L),
+        ],
+        _stream(res),
+    )
+    return out
