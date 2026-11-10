@@ -690,6 +690,117 @@ extern "C" __global__ void sg_stats_v_bf16(const bf16_t* x, int C, long long tok
 extern "C" __global__ void __launch_bounds__(256) DWV_WAVES sg_gate_v_f32(const float* x, float* out, DWT_ARGS, int C, int H, int W, SGV_ARGS) { dw_tokens_v<float>(x, DWT_PASS, out, C, H, W, SGV_PASS); }
 extern "C" __global__ void __launch_bounds__(256) DWV_WAVES sg_gate_v_f16(const _Float16* x, _Float16* out, DWT_ARGS, int C, int H, int W, SGV_ARGS) { dw_tokens_v<_Float16>(x, DWT_PASS, out, C, H, W, SGV_PASS); }
 extern "C" __global__ void __launch_bounds__(256) DWV_WAVES sg_gate_v_bf16(const bf16_t* x, bf16_t* out, DWT_ARGS, int C, int H, int W, SGV_ARGS) { dw_tokens_v<bf16_t>(x, DWT_PASS, out, C, H, W, SGV_PASS); }
+// dw_tokens_v without shared memory or barriers: each thread owns 4 channels of
+// one column and walks down DWC_TY rows with the 3x3 window in registers; the
+// left and right neighbours are loaded by the thread itself (the neighbouring
+// threads load the same rows, so those loads hit the L0/L1 caches). The next
+// row is loaded while the current one is computed. A thread trace of
+// dw_tokens_v on gfx1201 showed its waves ~45% waiting for loads and ~25% at
+// the per-row barrier; here nothing forces a wave to wait for other waves.
+#ifndef DWC_TY
+#define DWC_TY 16
+#endif
+__device__ __forceinline__ float f4c(const float4& v, int j) { return ((const float*)&v)[j]; }
+template <typename T>
+__device__ void dw_cols(const T* __restrict__ x, long long row_stride, int ch_offset,
+                        const float* __restrict__ w, const float* __restrict__ bias,
+                        int gelu, T* __restrict__ out, int C, int H, int W,
+                        const float* __restrict__ stats = nullptr,
+                        const float* __restrict__ gamma = nullptr,
+                        const float* __restrict__ beta = nullptr, int gate_off = -1,
+                        int out_ld = 0) {
+    const int vecs = C / 4;
+    const int ld = out_ld > C ? out_ld : C;
+    const int chunks = (ld / 4 + DWV_CV - 1) / DWV_CV;
+    const int b = blockIdx.z / chunks;
+    const int lv = threadIdx.x % DWV_CV, tx = threadIdx.x / DWV_CV;
+    const int cv = (blockIdx.z % chunks) * DWV_CV + lv;
+    const int ox = blockIdx.x * DWV_TX + tx;
+    const int y0 = blockIdx.y * DWC_TY;
+    if (ox >= W) return;
+    const long long L = (long long)H * W;
+    T* ob = out + (long long)b * L * ld;
+    const int y_end = min(y0 + DWC_TY, H);
+    if (cv >= vecs) {
+        // the zero padding columns of the output rows (padded GEMM input)
+        if (cv * 4 < ld) {
+            const float z[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            for (int y = y0; y < y_end; y++) store4(ob, ((long long)y * W + ox) * ld + cv * 4, z);
+        }
+        return;
+    }
+    const int c = cv * 4;
+    const T* xb = x + (long long)b * L * row_stride;
+    const long long base = ch_offset + c;
+    const int gin = gelu & 2;
+    const long long tok_row = (long long)b * L;
+
+    float k[4][9], bc[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int i = 0; i < 9; i++) k[j][i] = w[(c + j) * 9 + i];
+        bc[j] = bias ? bias[c + j] : 0.0f;
+    }
+    // one input row: its 3 positions (left, centre, right), transformed
+    auto load_row = [&](int y, float4 r[3]) {
+        #pragma unroll
+        for (int dx = 0; dx < 3; dx++) {
+            const int gx = ox - 1 + dx;
+            float v[4];
+            dwv_load(xb, row_stride, base, y, gx, H, W, v);
+            const bool inside = y >= 0 && y < H && gx >= 0 && gx < W;
+            r[dx] = dwv_norm(dwv_in<T>(v, gin), stats, gamma, beta, c,
+                             tok_row + (long long)y * W + gx, inside);
+        }
+    };
+    // Each input row adds its share to three output rows: kernel row 2 to the
+    // output above (emitted now), row 1 to the current, row 0 to the one below.
+    // p0 / p1 carry the partial sums of the next two outputs (8 registers
+    // instead of keeping three input rows).
+    float p0[4], p1[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++) p0[j] = p1[j] = bc[j];
+    float4 cur[3];
+    load_row(y0 - 1, cur);
+    for (int yy = y0 - 1; yy <= y_end; yy++) {
+        float4 nxt[3];
+        if (yy < y_end) load_row(yy + 1, nxt);  // prefetch while this row is used
+        const int oy = yy - 1;  // the output row completed by this input row
+        const bool emit = oy >= y0;
+        float g[4];
+        if (emit && gate_off >= 0) load4(xb, ((long long)oy * W + ox) * row_stride + gate_off + c, g);
+        float o[4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const float l = f4c(cur[0], j), m = f4c(cur[1], j), r = f4c(cur[2], j);
+            const float h0 = k[j][0] * l + k[j][1] * m + k[j][2] * r;
+            const float h1 = k[j][3] * l + k[j][4] * m + k[j][5] * r;
+            const float h2 = k[j][6] * l + k[j][7] * m + k[j][8] * r;
+            o[j] = p0[j] + h2;
+            p0[j] = p1[j] + h1;
+            p1[j] = bc[j] + h0;
+        }
+        if (emit) {
+            if (gelu & 1) {
+                #pragma unroll
+                for (int j = 0; j < 4; j++) o[j] = 0.5f * o[j] * (1.0f + fast_erff(o[j] * 0.70710678118654752f));
+            }
+            if (gate_off >= 0) {
+                const float4 gq = dwv_in<T>(g, gin);
+                o[0] *= gq.x; o[1] *= gq.y; o[2] *= gq.z; o[3] *= gq.w;
+            }
+            store4(ob, ((long long)oy * W + ox) * ld + c, o);
+        }
+        if (yy < y_end) {
+            #pragma unroll
+            for (int dx = 0; dx < 3; dx++) cur[dx] = nxt[dx];
+        }
+    }
+}
+extern "C" __global__ void __launch_bounds__(256) dw_cols_f32(const float* x, float* out, DWT_ARGS, int C, int H, int W) { dw_cols<float>(x, DWT_PASS, out, C, H, W); }
+extern "C" __global__ void __launch_bounds__(256) dw_cols_f16(const _Float16* x, _Float16* out, DWT_ARGS, int C, int H, int W) { dw_cols<_Float16>(x, DWT_PASS, out, C, H, W); }
+extern "C" __global__ void __launch_bounds__(256) dw_cols_bf16(const bf16_t* x, bf16_t* out, DWT_ARGS, int C, int H, int W) { dw_cols<bf16_t>(x, DWT_PASS, out, C, H, W); }
 
 // Statistics of a transposed ("channel") attention over the tokens, from a
 // (B, N, 3C) qkv buffer with heads of d <= 32 channels: per head the Gram
@@ -1990,6 +2101,7 @@ _PROGRAMS: dict[str, tuple[str, list[str], list[str]]] = {
         + [f"sg_gate_v_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"sg_stats_v_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"spatial_map_{s}" for s in _DTYPE_SUFFIX.values()]
+        + [f"dw_cols_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"chan_gram_{s}" for s in _DTYPE_SUFFIX.values()]
         + [f"add_ln_{s}" for s in _DTYPE_SUFFIX.values()]
         + ["add_ln_f32_f16"]
@@ -2580,6 +2692,16 @@ def window_attention(
 _SG_CC, _SG_SX, _SG_SY = 32, 8, 8
 _DWV_CV, _DWV_TX, _DWV_TY = 16, 16, 8
 _dwv = os.environ.get("SPANDREL_DW_VEC", "").strip() != "0"
+# dwconv_tokens on the barrier-free column kernel (dw_cols) instead of
+# dw_tokens_v: same at 256px tiles, ~24% faster at 512px and above, where the
+# input no longer fits the Infinity Cache. The SGFN spatial gate keeps
+# dw_tokens_v: its LayerNorm and GELU per loaded value would run three times
+# in the column kernel, which made it ~30% slower there.
+_DWC_TY = 16  # must match DWC_TY in the kernel source
+
+
+def _dw_cols() -> bool:
+    return os.environ.get("SPANDREL_DW_COLS", "1").strip() != "0"
 
 
 def can_spatial_gate(x: torch.Tensor, H: int, W: int) -> bool:  # noqa: N803
@@ -2726,8 +2848,9 @@ def dwconv_tokens(
         and x.data_ptr() % 16 == 0
     ):
         chunks = (channels // 4 + _DWV_CV - 1) // _DWV_CV
-        name = f"dw_tokens_v_{suffix}"
-        grid = (-(-W // _DWV_TX), -(-H // _DWV_TY), B * chunks)
+        cols = _dw_cols()
+        name = f"dw_{'cols' if cols else 'tokens_v'}_{suffix}"
+        grid = (-(-W // _DWV_TX), -(-H // (_DWC_TY if cols else _DWV_TY)), B * chunks)
     else:
         chunks = (channels + _SG_CC - 1) // _SG_CC
         name = f"dw_tokens_{suffix}"
