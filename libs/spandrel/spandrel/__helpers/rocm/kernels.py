@@ -12,6 +12,7 @@ from pathlib import Path
 
 import torch
 
+from . import hipblaslt
 from .common import version_of
 
 logger = logging.getLogger("spandrel.rocm")
@@ -2965,7 +2966,10 @@ def padded_linear(
             bp[:N] = bias.detach()
         cached = (key, wp, bp)
         lin.__dict__["_spandrel_padded_w"] = cached
-    out = torch.nn.functional.linear(inp, cached[1], cached[2])
+    # hipBLASLt with a timed algorithm (hipblaslt.py), else PyTorch's choice
+    out = hipblaslt.linear(inp, cached[1], cached[2])
+    if out is None:
+        out = torch.nn.functional.linear(inp, cached[1], cached[2])
     return out if n_full == N else out[..., :N]
 
 
